@@ -29,6 +29,8 @@ Already cloned elsewhere? Run `python scripts/install.py`.
 
 A final chat reply is not enough. Active Hermes sessions, background terminals, pending completion deliveries, subagents, running cron jobs, busy Desktop windows, and protected applications can all keep the PC awake.
 
+By default, background processes and cron jobs that were already running when you confirmed are treated as the campaign baseline. Work started afterwards still blocks. A strict “wait for all Hermes background processes” policy remains available.
+
 ### It stays awake when evidence is missing
 
 If a required sensor, task result, input reading, or Desktop connection is unknown, Power Guard does not continue toward sleep. A restart also cancels the current one-shot rule.

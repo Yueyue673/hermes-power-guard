@@ -301,6 +301,120 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(status["runtime"]["active_background_processes"], 1)
         self.assertEqual(status["runtime"]["active_delegations"], 2)
 
+    def test_duplicate_background_heartbeats_count_one_process_once(self):
+        self.arm_ready({
+            "background_process_policy": "wait_all",
+            "require_user_idle": False,
+            "quiescence_seconds": 0,
+        })
+        self.terminal_task()
+        details = json.dumps([
+            {"source": "process", "id": "preview", "command": "python server.py", "units": 1}
+        ])
+        with core._connect() as conn:
+            for owner in ("worker-a", "worker-b"):
+                conn.execute(
+                    "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                    "VALUES(?,?,?,1,0,?)",
+                    (owner, 999, time.time(), details),
+                )
+        core._evaluate()
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["state"], "running")
+        self.assertEqual(status["runtime"]["active_background_processes"], 1)
+        self.assertEqual(len(status["runtime"]["background_details"]), 1)
+
+    def test_preexisting_background_process_is_baselined_by_default(self):
+        before_arm = time.time() - 120
+        details = json.dumps([
+            {
+                "source": "process",
+                "id": "preview",
+                "command": "python server.py",
+                "started_at": before_arm,
+                "units": 1,
+            }
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                "VALUES('worker',999,?,1,0,?)",
+                (time.time(), details),
+            )
+        armed = self.arm_ready({"require_user_idle": False, "quiescence_seconds": 0})
+        self.assertEqual(armed["settings"]["background_process_policy"], "wait_new")
+        self.assertIn("process:preview", armed["runtime"]["background_baseline_ids"])
+        self.terminal_task()
+        core._evaluate()
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["active_background_processes"], 0)
+        self.assertNotEqual(status["runtime"]["state"], "running")
+
+        with core._connect() as conn:
+            conn.execute(
+                "UPDATE heartbeats SET updated_at=?,active_processes=0,process_details='[]' "
+                "WHERE owner_instance='worker'",
+                (time.time(),),
+            )
+        core._evaluate()
+        self.assertNotIn("process:preview", core.get_status()["runtime"]["background_baseline_ids"])
+
+        restarted = json.dumps([
+            {
+                "source": "process",
+                "id": "preview",
+                "command": "python server.py",
+                "started_at": float(armed["runtime"]["armed_at"]) + 10,
+                "units": 1,
+            }
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "UPDATE heartbeats SET updated_at=?,active_processes=1,process_details=? "
+                "WHERE owner_instance='worker'",
+                (time.time(), restarted),
+            )
+        core._evaluate()
+        restarted_status = core.get_status()
+        self.assertEqual(restarted_status["runtime"]["state"], "running")
+        self.assertEqual(restarted_status["runtime"]["active_background_processes"], 1)
+
+    def test_040_wait_all_default_migrates_once_to_campaign_scope(self):
+        with core._connect() as conn:
+            settings = core._meta_get(conn, "settings")
+            settings["background_process_policy"] = "wait_all"
+            core._meta_set(conn, "settings", settings)
+            conn.execute("DELETE FROM meta WHERE key='migration_background_policy_041'")
+        self.assertEqual(core.get_settings()["background_process_policy"], "wait_new")
+        with core._connect() as conn:
+            stored = core._meta_get(conn, "settings")
+            stored["background_process_policy"] = "wait_all"
+            core._meta_set(conn, "settings", stored)
+        self.assertEqual(core.get_settings()["background_process_policy"], "wait_all")
+
+    def test_background_process_started_after_arm_still_blocks(self):
+        armed = self.arm_ready({"require_user_idle": False, "quiescence_seconds": 0})
+        self.terminal_task()
+        details = json.dumps([
+            {
+                "source": "process",
+                "id": "new-preview",
+                "command": "python server.py",
+                "started_at": float(armed["runtime"]["armed_at"]) + 1,
+                "units": 1,
+            }
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                "VALUES('worker',999,?,1,0,?)",
+                (time.time(), details),
+            )
+        core._evaluate()
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["state"], "running")
+        self.assertEqual(status["runtime"]["active_background_processes"], 1)
+
     def test_other_desktop_profile_busy_state_blocks_countdown(self):
         self.arm_ready({"require_user_idle": False, "quiescence_seconds": 30})
         self.terminal_task()
@@ -489,6 +603,89 @@ class PowerGuardCoreTests(unittest.TestCase):
         with mock.patch.object(core, "_set_execution_state") as execution_state:
             core.cancel("thread-safety")
         execution_state.assert_not_called()
+
+    def test_final_safety_check_uses_campaign_scoped_background_work(self):
+        details = json.dumps([
+            {
+                "source": "process",
+                "id": "preview",
+                "command": "python server.py",
+                "started_at": time.time() - 120,
+                "units": 1,
+            }
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                "VALUES('worker',999,?,1,0,?)",
+                (time.time(), details),
+            )
+        self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        token = "final-check-token"
+        with core._connect() as conn:
+            runtime = core._meta_get(conn, "runtime")
+            runtime.update({
+                "state": "executing",
+                "countdown_token": token,
+                "action_claimed_by": core.PROCESS_INSTANCE,
+                "countdown_last_input_at": time.time() - 60,
+                "ui_heartbeat_at": time.time(),
+            })
+            core._meta_set(conn, "runtime", runtime)
+        claim = {"token": token, "action": "sleep", "simulate": False}
+        with mock.patch.object(core.time, "sleep"), mock.patch.object(
+            core, "_user_idle_seconds", return_value=600
+        ), mock.patch.object(core, "_protected_processes_running", return_value=([], True)):
+            self.assertTrue(core._claim_still_safe(claim))
+
+    def test_preexisting_daemon_reaches_real_sleep_request_boundary(self):
+        details = json.dumps([
+            {
+                "source": "process",
+                "id": "preview",
+                "command": "python server.py",
+                "started_at": time.time() - 120,
+                "units": 1,
+            }
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                "VALUES('worker',999,?,1,0,?)",
+                (time.time(), details),
+            )
+        self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        self.assertIsNone(core._evaluate())
+        with core._connect() as conn:
+            runtime = core._meta_get(conn, "runtime")
+            runtime["quiet_since"] = time.time() - 31
+            core._meta_set(conn, "runtime", runtime)
+        self.assertIsNone(core._evaluate())
+        self.make_due()
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_DESKTOP": "1", "POWER_GUARD_TEST_MODE": "0"},
+            clear=False,
+        ):
+            claim = core._evaluate()
+        self.assertIsNotNone(claim)
+        self.assertFalse(claim["simulate"])
+        with mock.patch.object(core.time, "sleep"), mock.patch.object(
+            core, "_user_idle_seconds", return_value=600
+        ), mock.patch.object(core, "_protected_processes_running", return_value=([], True)):
+            self.assertTrue(core._claim_still_safe(claim))
+        self.assertTrue(core._claim_token_is_current(claim))
+        with mock.patch.object(
+            core, "_execute_power_action", return_value=(True, "Sleep requested")
+        ) as execute:
+            success, message = core._execute_power_action("sleep", False)
+        execute.assert_called_once_with("sleep", False)
+        core._finalize_action(claim, success, message)
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["state"], "action_requested")
+        self.assertEqual(status["runtime"]["last_action"]["message"], "Sleep requested")
 
     def test_final_claim_token_check_observes_cancellation(self):
         self.arm_ready({"require_user_idle": False, "dry_run": False})

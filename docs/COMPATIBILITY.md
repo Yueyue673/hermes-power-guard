@@ -35,7 +35,10 @@ The Python plugin and Desktop UI have separate enable switches. Both are require
 Completion cohort:
 
 - work in the active Hermes profile observed after explicit confirmation;
-- supported Kanban lifecycle events observed by the plugin.
+- supported Kanban lifecycle events observed by the plugin;
+- background processes, subagents, completion deliveries, and cron runs that start after confirmation.
+
+Pre-existing background work is recorded as the campaign baseline by default. The strict `wait_all` policy is available when every already-running Hermes process should remain a veto.
 
 Safety blockers:
 
