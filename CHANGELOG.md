@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] - 2026-08-28
+
+### Fixed
+
+- Pre-existing preview servers, daemons, and already-running cron jobs are now captured as the one-shot campaign baseline instead of blocking sleep forever.
+- Background work started after confirmation still blocks until it finishes.
+- Duplicate heartbeat observations from multiple Hermes processes are deduplicated by source and stable ID instead of being summed.
+- Existing 0.4.0 installations migrate once from the former `wait_all` default to campaign-scoped `wait_new`; users can still select the strict policy afterwards.
+
 ## [0.4.0] - 2026-08-28
 
 ### Product design

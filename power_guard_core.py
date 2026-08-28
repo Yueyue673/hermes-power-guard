@@ -81,7 +81,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "stale_heartbeat_seconds": 20,
     "stale_task_seconds": 3600,
     "arm_expiry_minutes": 720,
-    "background_process_policy": "wait_all",  # wait_all | ignore_detached
+    "background_process_policy": "wait_new",  # wait_new | wait_all | ignore_detached
     "cancel_on_new_activity": True,
     "prevent_sleep_while_working": True,
     "turn_off_display_when_idle": False,
@@ -95,7 +95,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 
 ALLOWED_ACTIONS = {"shutdown", "hibernate", "sleep", "lock", "notify"}
 ALLOWED_TRIGGER_MODES = {"done_only", "done_or_blocked"}
-ALLOWED_BACKGROUND_POLICIES = {"wait_all", "ignore_detached"}
+ALLOWED_BACKGROUND_POLICIES = {"wait_new", "wait_all", "ignore_detached"}
 ALLOWED_POWER_PLANS = {"unchanged", "balanced", "power_saver"}
 
 # A turn ending for one of these reasons cannot make further automatic progress
@@ -309,8 +309,18 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    if _meta_get(conn, "settings") is None:
+    stored_settings = _meta_get(conn, "settings")
+    if stored_settings is None:
         _meta_set(conn, "settings", DEFAULT_SETTINGS)
+        _meta_set(conn, "migration_background_policy_041", True)
+    elif _meta_get(conn, "migration_background_policy_041") is None:
+        # 0.4.0 wrote wait_all as the default, so a forgotten preview server
+        # made the common preset impossible to finish. Migrate once; users can
+        # still explicitly choose the strict wait_all policy afterwards.
+        if isinstance(stored_settings, dict) and stored_settings.get("background_process_policy") == "wait_all":
+            stored_settings["background_process_policy"] = "wait_new"
+            _meta_set(conn, "settings", stored_settings)
+        _meta_set(conn, "migration_background_policy_041", True)
     if _meta_get(conn, "runtime") is None:
         _meta_set(conn, "runtime", _fresh_runtime())
 
@@ -321,6 +331,7 @@ def _fresh_runtime() -> Dict[str, Any]:
         "state": "disarmed",
         "armed_at": None,
         "armed_expires_at": None,
+        "background_baseline_ids": [],
         "activity_seen": False,
         "snooze_until": None,
         "quiet_since": None,
@@ -504,6 +515,27 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         generation = int(runtime.get("generation") or 0) + 1
         settings["armed"] = True
         armed_at = _now()
+        baseline_ids: set[str] = set()
+        if settings.get("background_process_policy") == "wait_new":
+            cutoff = armed_at - int(settings.get("stale_heartbeat_seconds") or 20)
+            for row in conn.execute(
+                "SELECT process_details FROM heartbeats WHERE updated_at>=?",
+                (cutoff,),
+            ).fetchall():
+                try:
+                    heartbeat_details = json.loads(row["process_details"] or "[]")
+                except (TypeError, ValueError):
+                    heartbeat_details = []
+                for item in heartbeat_details:
+                    if isinstance(item, dict) and not _background_detail_key(item).split(":", 1)[0].startswith("sensor_"):
+                        baseline_ids.add(_background_detail_key(item))
+            _, _, local_details = _background_snapshot(
+                settings,
+                include_preexisting=True,
+            )
+            for item in local_details:
+                if not _background_detail_key(item).split(":", 1)[0].startswith("sensor_"):
+                    baseline_ids.add(_background_detail_key(item))
         runtime = _fresh_runtime()
         runtime.update(
             {
@@ -511,13 +543,19 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 "state": "armed_waiting_for_task",
                 "armed_at": armed_at,
                 "armed_expires_at": armed_at + int(settings["arm_expiry_minutes"]) * 60,
+                "background_baseline_ids": sorted(baseline_ids),
                 "activity_seen": False,
                 "ui_heartbeat_at": ui_heartbeat_at,
             }
         )
         _meta_set(conn, "settings", settings)
         _meta_set(conn, "runtime", runtime)
-        _event(conn, "armed", f"Armed generation {generation}", {"action": settings["action"]})
+        _event(
+            conn,
+            "armed",
+            f"Armed generation {generation}",
+            {"action": settings["action"], "background_baseline_count": len(baseline_ids)},
+        )
         conn.commit()
     start_monitor()
     return get_status()
@@ -991,11 +1029,68 @@ def record_kanban(task_id: str, status: str, reason: str = "", board: str = "", 
     start_monitor()
 
 
-def _background_snapshot(settings: Dict[str, Any]) -> tuple[int, int, list[Dict[str, Any]]]:
-    processes = 0
-    delegations = 0
-    pending_events = 0
+def _background_detail_key(detail: Dict[str, Any]) -> str:
+    source = str(detail.get("source") or "")
+    identifier = str(detail.get("id") or "")
+    if not source:
+        command = str(detail.get("command") or "")
+        if identifier.startswith("sensor:async"):
+            source = "sensor_delegation"
+        elif identifier.startswith("sensor:cron"):
+            source = "sensor_cron"
+        elif identifier.startswith("sensor:"):
+            source = "sensor_process"
+        elif command == "cron job":
+            source = "cron"
+        else:
+            source = "process"
+    return f"{source}:{identifier}"
+
+
+def _background_detail_bucket(detail: Dict[str, Any]) -> str:
+    source = _background_detail_key(detail).split(":", 1)[0]
+    if source in {"delegation", "completion_queue", "sensor_delegation"}:
+        return "delegation"
+    return "process"
+
+
+def _background_snapshot(
+    settings: Dict[str, Any],
+    *,
+    baseline_ids: Optional[set[str]] = None,
+    armed_at: Optional[float] = None,
+    include_preexisting: bool = False,
+) -> tuple[int, int, list[Dict[str, Any]]]:
+    """Return background work visible to this process.
+
+    ``wait_new`` is campaign-scoped: work already running when the user
+    confirms the one-shot action is a baseline, not a permanent veto. Work
+    that starts afterwards still blocks. Sensor failures are never filtered.
+    """
+    policy = str(settings.get("background_process_policy") or "wait_new")
+    baseline = baseline_ids or set()
     details: list[Dict[str, Any]] = []
+    now = _now()
+
+    def add(detail: Dict[str, Any]) -> None:
+        detail = dict(detail)
+        detail["units"] = max(1, int(detail.get("units") or 1))
+        source = str(detail.get("source") or "")
+        if policy == "ignore_detached" and source == "process" and detail.get("detached"):
+            return
+        if policy == "wait_new" and not include_preexisting and not source.startswith("sensor_"):
+            started_at = detail.get("started_at")
+            if _background_detail_key(detail) in baseline:
+                return
+            if armed_at is not None and started_at is not None:
+                try:
+                    if float(started_at) <= float(armed_at):
+                        return
+                except (TypeError, ValueError):
+                    pass
+        details.append(detail)
+
+    pending_events = 0
     try:
         from tools.process_registry import process_registry
 
@@ -1003,50 +1098,96 @@ def _background_snapshot(settings: Dict[str, Any]) -> tuple[int, int, list[Dict[
         for row in rows:
             if row.get("status") != "running":
                 continue
-            if settings.get("background_process_policy") == "ignore_detached" and row.get("detached"):
-                continue
-            processes += 1
-            details.append(
+            uptime = max(0.0, float(row.get("uptime_seconds") or 0.0))
+            add(
                 {
+                    "source": "process",
                     "id": row.get("session_id"),
                     "command": str(row.get("command") or "")[:160],
                     "detached": bool(row.get("detached")),
+                    "started_at": now - uptime,
                 }
             )
-        # A child/process can be finished but its completion event still needs
-        # to re-enter the parent conversation. Until the shared queue drains,
-        # Hermes has automatic follow-up work left and shutdown is premature.
-        pending_events = int(process_registry.completion_queue.qsize())
+        pending_events = max(0, int(process_registry.completion_queue.qsize()))
+        if pending_events:
+            add(
+                {
+                    "source": "completion_queue",
+                    "id": "pending",
+                    "command": "pending completion delivery",
+                    "units": pending_events,
+                }
+            )
     except Exception:
-        # Unknown is not zero. A broken sensor must veto real power actions
-        # until the next successful sample rather than silently hiding work.
-        processes += 1
-        details.append({"id": "sensor:process_registry", "command": "sensor unavailable", "detached": False})
+        # Unknown is not zero. A broken sensor must veto real power actions.
+        add(
+            {
+                "source": "sensor_process",
+                "id": "sensor:process_registry",
+                "command": "sensor unavailable",
+            }
+        )
         logger.debug("Could not inspect Hermes background processes", exc_info=True)
-    try:
-        from tools.async_delegation import active_task_count
 
-        delegations = int(active_task_count()) + pending_events
+    try:
+        from tools.async_delegation import list_async_delegations
+
+        for record in list_async_delegations():
+            if record.get("status") not in {"running", "stalling", "finalizing"}:
+                continue
+            goals = record.get("goals")
+            units = len(goals) if record.get("is_batch") and isinstance(goals, (list, tuple)) and goals else 1
+            add(
+                {
+                    "source": "delegation",
+                    "id": record.get("delegation_id"),
+                    "command": "subagent batch" if record.get("is_batch") else "subagent",
+                    "units": units,
+                    "started_at": record.get("dispatched_at"),
+                }
+            )
     except Exception:
-        delegations = pending_events + 1
-        details.append({"id": "sensor:async_delegation", "command": "sensor unavailable", "detached": False})
+        add(
+            {
+                "source": "sensor_delegation",
+                "id": "sensor:async_delegation",
+                "command": "sensor unavailable",
+            }
+        )
         logger.debug("Could not inspect async delegations", exc_info=True)
+
     try:
         from cron.scheduler import get_running_job_ids
 
-        cron_ids = list(get_running_job_ids())
-        processes += len(cron_ids)
-        details.extend({"id": job_id, "command": "cron job", "detached": False} for job_id in cron_ids)
+        for job_id in get_running_job_ids():
+            add({"source": "cron", "id": job_id, "command": "cron job"})
     except Exception:
-        processes += 1
-        details.append({"id": "sensor:cron", "command": "sensor unavailable", "detached": False})
+        add({"source": "sensor_cron", "id": "sensor:cron", "command": "sensor unavailable"})
         logger.debug("Could not inspect running cron jobs", exc_info=True)
+
+    processes = sum(
+        int(item.get("units") or 1)
+        for item in details
+        if _background_detail_bucket(item) == "process"
+    )
+    delegations = sum(
+        int(item.get("units") or 1)
+        for item in details
+        if _background_detail_bucket(item) == "delegation"
+    )
     return processes, delegations, details
 
 
 def _heartbeat() -> None:
-    settings = get_settings()
-    processes, delegations, details = _background_snapshot(settings)
+    with _connect() as conn:
+        settings = validate_settings(_meta_get(conn, "settings") or {})
+    # Heartbeats publish raw observable work. Campaign scoping happens once in
+    # _evaluate after rows from every process are deduplicated; filtering here
+    # would make a baseline disappear, then reappear as falsely "new" work.
+    processes, delegations, details = _background_snapshot(
+        settings,
+        include_preexisting=True,
+    )
     with _connect() as conn:
         conn.execute(
             """
@@ -1128,6 +1269,107 @@ def _eligible_terminal(outcome: str, settings: Dict[str, Any]) -> bool:
     if outcome == "interrupted":
         return bool(settings.get("include_interrupted"))
     return False
+
+
+def _aggregate_background_heartbeats(
+    conn: sqlite3.Connection,
+    settings: Dict[str, Any],
+    runtime: Dict[str, Any],
+    now: float,
+) -> tuple[int, int, list[Dict[str, Any]]]:
+    """Deduplicate and campaign-scope all fresh background observations."""
+    stale_heartbeat = int(settings["stale_heartbeat_seconds"])
+    heartbeat_rows = conn.execute(
+        "SELECT * FROM heartbeats WHERE updated_at>=?", (now - stale_heartbeat,)
+    ).fetchall()
+    fallback_processes = max(
+        (int(row["active_processes"] or 0) for row in heartbeat_rows),
+        default=0,
+    )
+    fallback_delegations = max(
+        (int(row["active_delegations"] or 0) for row in heartbeat_rows),
+        default=0,
+    )
+    details_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in heartbeat_rows:
+        try:
+            row_details = json.loads(row["process_details"] or "[]")
+        except (TypeError, ValueError):
+            row_details = []
+        if not row_details:
+            owner = str(row["owner_instance"] or "unknown")
+            if int(row["active_processes"] or 0):
+                row_details.append(
+                    {
+                        "source": "sensor_process",
+                        "id": f"sensor:legacy_process:{owner}",
+                        "command": "legacy heartbeat without process identities",
+                        "units": int(row["active_processes"] or 0),
+                    }
+                )
+            if int(row["active_delegations"] or 0):
+                row_details.append(
+                    {
+                        "source": "sensor_delegation",
+                        "id": f"sensor:legacy_delegation:{owner}",
+                        "command": "legacy heartbeat without delegation identities",
+                        "units": int(row["active_delegations"] or 0),
+                    }
+                )
+        for item in row_details:
+            if not isinstance(item, dict):
+                continue
+            key = _background_detail_key(item)
+            existing = details_by_key.get(key)
+            if existing is None or int(item.get("units") or 1) > int(existing.get("units") or 1):
+                details_by_key[key] = dict(item)
+
+    background_details = list(details_by_key.values())
+    if settings.get("background_process_policy") == "wait_new":
+        baseline = {str(item) for item in runtime.get("background_baseline_ids") or []}
+        observed_keys = {
+            _background_detail_key(item)
+            for item in background_details
+            if not _background_detail_key(item).split(":", 1)[0].startswith("sensor_")
+        }
+        baseline.intersection_update(observed_keys)
+        runtime["background_baseline_ids"] = sorted(baseline)
+        armed_at = runtime.get("armed_at")
+        scoped_details: list[Dict[str, Any]] = []
+        for item in background_details:
+            source = _background_detail_key(item).split(":", 1)[0]
+            if source.startswith("sensor_"):
+                scoped_details.append(item)
+                continue
+            if _background_detail_key(item) in baseline:
+                continue
+            started_at = item.get("started_at")
+            if armed_at is not None and started_at is not None:
+                try:
+                    if float(started_at) <= float(armed_at):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            scoped_details.append(item)
+        background_details = scoped_details
+
+    detail_processes = sum(
+        max(1, int(item.get("units") or 1))
+        for item in background_details
+        if _background_detail_bucket(item) == "process"
+    )
+    detail_delegations = sum(
+        max(1, int(item.get("units") or 1))
+        for item in background_details
+        if _background_detail_bucket(item) == "delegation"
+    )
+    if settings.get("background_process_policy") == "wait_new" and details_by_key:
+        return detail_processes, detail_delegations, background_details
+    return (
+        max(detail_processes, fallback_processes),
+        max(detail_delegations, fallback_delegations),
+        background_details,
+    )
 
 
 def _evaluate() -> Optional[Dict[str, Any]]:
@@ -1227,17 +1469,9 @@ def _evaluate() -> Optional[Dict[str, Any]]:
         terminal_tasks = [row for row in task_rows if row["outcome"]]
         ineligible = [row for row in terminal_tasks if not _eligible_terminal(str(row["outcome"]), settings)]
 
-        heartbeat_rows = conn.execute(
-            "SELECT * FROM heartbeats WHERE updated_at>=?", (now - stale_heartbeat,)
-        ).fetchall()
-        background_processes = sum(int(row["active_processes"] or 0) for row in heartbeat_rows)
-        delegations = sum(int(row["active_delegations"] or 0) for row in heartbeat_rows)
-        background_details: list[Dict[str, Any]] = []
-        for row in heartbeat_rows:
-            try:
-                background_details.extend(json.loads(row["process_details"] or "[]"))
-            except (TypeError, ValueError):
-                pass
+        background_processes, delegations, background_details = _aggregate_background_heartbeats(
+            conn, settings, runtime, now
+        )
 
         runtime["active_tasks"] = len(active_tasks)
         runtime["active_background_processes"] = background_processes
@@ -1498,13 +1732,10 @@ def _claim_still_safe(claim: Dict[str, Any]) -> bool:
         if active_task_count:
             reasons.append(f"{active_task_count} task(s) became active")
 
-        stale_heartbeat = int(settings["stale_heartbeat_seconds"])
-        bg_row = conn.execute(
-            "SELECT COALESCE(SUM(active_processes),0), COALESCE(SUM(active_delegations),0) "
-            "FROM heartbeats WHERE updated_at>=?",
-            (now - stale_heartbeat,),
-        ).fetchone()
-        if int(bg_row[0] or 0) or int(bg_row[1] or 0):
+        background_processes, delegations, _ = _aggregate_background_heartbeats(
+            conn, settings, runtime, now
+        )
+        if background_processes or delegations:
             reasons.append("background work became active")
         if int(runtime.get("desktop_busy_count") or 0):
             reasons.append("another Desktop session is busy")

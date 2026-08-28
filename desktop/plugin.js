@@ -56,7 +56,7 @@ const PRESETS = [
       action: 'sleep', trigger_mode: 'done_or_blocked', include_failures: true,
       include_interrupted: false, detect_blocker_text: false, require_user_idle: true,
       user_idle_seconds: 300, quiescence_seconds: 30, countdown_seconds: 90,
-      waiting_input_timeout_seconds: 900, background_process_policy: 'wait_all',
+      waiting_input_timeout_seconds: 900, background_process_policy: 'wait_new',
       prevent_sleep_while_working: true, turn_off_display_when_idle: false,
       lower_hermes_priority: false, power_plan: 'unchanged', arm_expiry_minutes: 720, dry_run: false
     }
@@ -69,7 +69,7 @@ const PRESETS = [
       action: 'sleep', trigger_mode: 'done_only', include_failures: false,
       include_interrupted: false, detect_blocker_text: false, require_user_idle: true,
       user_idle_seconds: 600, quiescence_seconds: 60, countdown_seconds: 120,
-      background_process_policy: 'wait_all', arm_expiry_minutes: 720, dry_run: false
+      background_process_policy: 'wait_new', arm_expiry_minutes: 720, dry_run: false
     }
   },
   {
@@ -80,7 +80,7 @@ const PRESETS = [
       action: 'sleep', trigger_mode: 'done_or_blocked', include_failures: true,
       include_interrupted: false, detect_blocker_text: false, require_user_idle: true,
       user_idle_seconds: 300, quiescence_seconds: 60, countdown_seconds: 120,
-      background_process_policy: 'wait_all', prevent_sleep_while_working: true,
+      background_process_policy: 'wait_new', prevent_sleep_while_working: true,
       turn_off_display_when_idle: true, display_off_idle_seconds: 300,
       lower_hermes_priority: true, power_plan: 'balanced', restore_power_plan: true,
       arm_expiry_minutes: 1440, dry_run: false
@@ -418,7 +418,7 @@ function PolicyView({ status, draft, update, applyPreset }) {
     jsxs(FlatSection, { title: '防误触发', description: '未知状态始终阻止执行；这些条件全部满足才进入最后确认。', defaultOpen: false, children: [
       jsx(ToggleRow, { label: '必须检测到用户空闲', help: '仍在使用键盘鼠标时不执行最终动作。', checked: draft.require_user_idle, onChange: value => update('require_user_idle', value) }),
       jsx(NumberRow, { label: '用户空闲时间', help: draft.require_user_idle ? '从最后一次键盘或鼠标输入开始计算。' : '启用上方规则后可设置。', value: draft.user_idle_seconds, onChange: value => update('user_idle_seconds', value), min: 0, max: 86400, disabled: !draft.require_user_idle }),
-      jsx(SelectRow, { label: '后台进程', help: '预览服务器或守护进程可能长期运行。', value: draft.background_process_policy, onChange: value => update('background_process_policy', value), options: [{ value: 'wait_all', label: '等待全部 Hermes 后台进程' }, { value: 'ignore_detached', label: '忽略 detached 守护进程' }] }),
+      jsx(SelectRow, { label: '后台进程', help: '默认只等待本次启用后新启动的进程，已有预览服务器不会永久阻止睡眠。', value: draft.background_process_policy, onChange: value => update('background_process_policy', value), options: [{ value: 'wait_new', label: '只等待本次启用后启动的进程' }, { value: 'wait_all', label: '等待所有 Hermes 后台进程' }, { value: 'ignore_detached', label: '忽略 detached 守护进程' }] }),
       jsx(Row, { label: '受保护程序', help: '这些 exe 运行时不执行，一行一个。', top: true, children: jsx(Textarea, { className: 'min-h-24 w-80 max-w-full resize-y', onChange: event => update('protected_processes_text', event.target.value), placeholder: 'blender.exe\nobs64.exe', value: draft.protected_processes_text || '' }) })
     ] })
   ] })
