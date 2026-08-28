@@ -28,10 +28,15 @@ class PowerGuardCoreTests(unittest.TestCase):
         core.DB_PATH = self.state_dir / "state.db"
         core.LOG_PATH = self.state_dir / "power-guard.log"
         # Unit tests drive ticks deterministically; never start daemon monitors.
+        # Keep countdown-input tests deterministic on non-Windows CI; tests that
+        # exercise active/missing input sensors override this mock explicitly.
+        self.idle_patcher = mock.patch.object(core, "_user_idle_seconds", return_value=600)
+        self.idle_patcher.start()
         core._MONITOR_STARTED = True
         core.reset_for_tests()
 
     def tearDown(self) -> None:
+        self.idle_patcher.stop()
         core._MONITOR_STARTED = self.old_monitor_started
         core.STATE_DIR = self.old_state_dir
         core.DB_PATH = self.old_db_path
