@@ -1891,6 +1891,29 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
     protected_ok = not runtime.get("protected_processes_running") and runtime.get(
         "protected_process_scan_ok", True
     )
+    now = _now()
+    active_tasks = int(runtime.get("active_tasks") or 0)
+    background = int(runtime.get("active_background_processes") or 0)
+    delegations = int(runtime.get("active_delegations") or 0)
+    desktop_busy = int(runtime.get("desktop_busy_count") or 0)
+    idle_remaining = max(
+        0,
+        int(settings.get("user_idle_seconds") or 0) - int(idle_seconds or 0),
+    )
+    quiet_remaining = max(
+        0,
+        int(settings.get("quiescence_seconds") or 0)
+        - int(now - float(runtime.get("quiet_since") or now)),
+    )
+    ineligible_count = len(runtime.get("ineligible") or [])
+    protected_names = ", ".join(runtime.get("protected_processes_running") or [])
+    action_name = {
+        "sleep": "睡眠",
+        "shutdown": "关机",
+        "hibernate": "休眠",
+        "lock": "锁屏",
+        "notify": "提醒",
+    }.get(str(settings.get("action") or "sleep"), "电源动作")
 
     terminal_status = "blocked" if state == "terminal_not_eligible" else (
         "pass" if terminal_count and active_total == 0 else "wait"
@@ -1903,42 +1926,124 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
         "blocked" if state in {"error", "expired"} else "active" if state in {"countdown", "executing"} else "wait"
     )
 
+    armed_gate = "pass" if settings.get("armed") else "blocked" if state == "expired" else "wait"
+    activity_gate = "pass" if runtime.get("activity_seen") else "wait"
+    work_gate = "pass" if runtime.get("activity_seen") and active_total == 0 else "active" if active_total else "wait"
     gates = [
-        {"id": "armed", "label": "已确认武装", "status": "pass" if settings.get("armed") else "blocked" if state == "expired" else "wait"},
-        {"id": "activity", "label": "已观察到新任务", "status": "pass" if runtime.get("activity_seen") else "wait"},
-        {"id": "work", "label": "自动工作已清空", "status": "pass" if runtime.get("activity_seen") and active_total == 0 else "active" if active_total else "wait", "value": active_total},
-        {"id": "terminal", "label": "终态符合规则", "status": terminal_status, "value": terminal_count},
-        {"id": "safety", "label": "用户与桌面安全门", "status": safety_status},
-        {"id": "quiet", "label": "静默确认完成", "status": quiet_status},
-        {"id": "action", "label": "最终动作", "status": action_status},
+        {
+            "id": "armed",
+            "label": "本次自动睡眠已启用" if armed_gate == "pass" else "本次自动睡眠已失效" if armed_gate == "blocked" else "本次自动睡眠未启用",
+            "status": armed_gate,
+            "detail": "仅跟踪启用后开始的任务" if armed_gate == "pass" else "不会执行电源动作",
+        },
+        {
+            "id": "activity",
+            "label": "新任务已开始" if activity_gate == "pass" else "等待启用后的第一个任务",
+            "status": activity_gate,
+            "detail": "已记录本次任务" if activity_gate == "pass" else "已有任务不会被倒追",
+        },
+        {
+            "id": "work",
+            "label": "Hermes 工作已结束" if work_gate == "pass" else "等待 Hermes 工作结束" if work_gate == "active" else "等待 Hermes 工作",
+            "status": work_gate,
+            "value": active_total,
+            "detail": f"剩余 {active_total} 项" if active_total else "没有活动工作",
+        },
+        {
+            "id": "terminal",
+            "label": "任务结果不符合规则" if terminal_status == "blocked" else "任务结果符合规则" if terminal_status == "pass" else "等待任务结果",
+            "status": terminal_status,
+            "value": terminal_count,
+            "detail": f"{ineligible_count} 个结果不符合规则" if ineligible_count else f"已确认 {terminal_count} 个结果",
+        },
+        {
+            "id": "safety",
+            "label": "桌面与输入检查通过" if safety_status == "pass" else "检查桌面与输入",
+            "status": safety_status,
+            "detail": "没有发现阻止条件" if safety_status == "pass" else "等待输入、窗口或进程条件",
+        },
+        {
+            "id": "quiet",
+            "label": "迟到任务检查完成" if quiet_status == "pass" else "正在检查迟到任务" if quiet_status == "active" else "等待迟到任务检查",
+            "status": quiet_status,
+            "detail": f"还需 {quiet_remaining} 秒" if quiet_status == "active" else "已完成" if quiet_status == "pass" else "尚未开始",
+        },
+        {
+            "id": "action",
+            "label": f"已发送{action_name}请求" if action_status == "pass" else f"正在发送{action_name}请求" if action_status == "active" else f"等待{action_name}请求",
+            "status": action_status,
+            "detail": "已发送" if action_status == "pass" else "等待前置条件",
+        },
     ]
 
+    running_parts = []
+    if active_tasks:
+        running_parts.append(f"会话 {active_tasks}")
+    if background:
+        running_parts.append(f"后台 {background}")
+    if delegations:
+        running_parts.append(f"子代理 {delegations}")
+    if desktop_busy:
+        running_parts.append(f"其他窗口 {desktop_busy}")
+    running_detail = " · ".join(running_parts) or "等待 Hermes 更新任务状态"
+    first_ineligible = (runtime.get("ineligible") or [{}])[0]
+    ineligible_reason = str(first_ineligible.get("reason") or "未知或中断的结果")
+
     summaries = {
-        "disarmed": ("尚未启用", "确认设置后武装，Power Guard 才会观察之后开始的新任务。"),
-        "armed_waiting_for_task": ("等待新任务", "武装前已经存在的旧任务不会触发自动电源动作。"),
-        "running": ("Hermes 仍在工作", f"还有 {active_total} 个活动工作单元；完成后会自动进入安全门。"),
-        "waiting_for_desktop_ui": ("等待桌面控制面板", "Desktop 心跳不可见，已禁止进入倒计时。"),
-        "waiting_for_terminal_signal": ("等待终态信号", "任务看似空闲，但还没有足够证据判断完成或阻塞。"),
-        "terminal_not_eligible": ("当前终态不允许执行", "存在中断、未知结果，或不符合你选择的完成规则。"),
-        "waiting_for_protected_process": ("受保护程序仍在运行", "关闭或移出保护列表后会重新判断。"),
-        "waiting_for_idle_check": ("无法确认用户空闲", "读取不到系统空闲状态时会保持唤醒，不会冒险执行。"),
-        "waiting_for_user_idle": ("等待你离开电脑", f"需要连续空闲 {int(settings['user_idle_seconds']) // 60} 分钟。"),
-        "armed_waiting_for_quiet": ("重新确认中", "新活动或设置变化撤销了旧倒计时，正在重新对账。"),
-        "quiescence": ("静默确认中", f"保持无新工作 {settings['quiescence_seconds']} 秒后进入倒计时。"),
-        "snoozed": ("已延后", f"剩余 {runtime.get('snooze_remaining_seconds') or 0} 秒后重新判断。"),
-        "countdown": ("最终倒计时", f"剩余 {runtime.get('countdown_remaining_seconds') or 0} 秒；任何活动都会取消。"),
-        "executing": ("正在执行最终动作", "已经进入最后复核阶段。"),
-        "action_requested": ("系统请求已发送", "Windows 已接受请求；实际睡眠结果由系统和应用决定。"),
+        "disarmed": (f"自动{action_name}未启用", "当前不会执行任何电源动作。"),
+        "armed_waiting_for_task": ("等待启用后的第一个任务", f"已有任务不会被倒追，也不会单独触发{action_name}。"),
+        "running": (f"Hermes 还有 {active_total} 项工作", running_detail),
+        "waiting_for_desktop_ui": ("控制面板已离线", "无法显示或取消倒计时，因此电脑保持唤醒。"),
+        "waiting_for_terminal_signal": ("任务结束信号不完整", "没有可确认的完成或阻塞结果，因此电脑保持唤醒。"),
+        "terminal_not_eligible": (f"{max(1, ineligible_count)} 个任务结果不符合规则", ineligible_reason),
+        "waiting_for_protected_process": ("受保护程序仍在运行", protected_names or "进程检查尚未通过。"),
+        "waiting_for_idle_check": ("读不到键鼠空闲时间", "没有输入证据，因此电脑保持唤醒。"),
+        "waiting_for_user_idle": ("刚刚检测到键鼠操作", f"再空闲 {idle_remaining} 秒后开始迟到任务检查。"),
+        "armed_waiting_for_quiet": ("条件发生变化", "旧倒计时已取消，正在重新检查全部条件。"),
+        "quiescence": ("正在检查迟到任务", f"还需 {quiet_remaining} 秒没有新活动。"),
+        "snoozed": (f"本次自动{action_name}已延后", f"{runtime.get('snooze_remaining_seconds') or 0} 秒后重新检查全部条件。"),
+        "countdown": (f"{runtime.get('countdown_remaining_seconds') or 0} 秒后{action_name}", "键鼠输入、新任务或控制面板离线都会取消。"),
+        "executing": (f"正在向 Windows 请求{action_name}", "正在做最后一次任务、输入和取消状态检查。"),
+        "action_requested": (f"已向 Windows 请求{action_name}", "系统或应用仍可拒绝；Power Guard 不会自动重试。"),
         "action_complete": ("动作已完成", str((runtime.get("last_action") or {}).get("message") or "完成")),
-        "expired": ("武装已过期", "长时间没有完成动作，已自动解除武装。"),
-        "error": ("执行失败", str(runtime.get("last_error") or "查看事件记录获取详情。")),
+        "expired": (f"本次自动{action_name}已失效", "未执行任何电源动作。需要时请重新启用。"),
+        "error": ("Windows 没有接受电源请求", str(runtime.get("last_error") or "Power Guard 不会自动重试。")),
+        "waiting_for_desktop_backend": ("等待本机 Desktop 后端", "只有本机 Hermes Desktop 可以发送真实电源请求。"),
     }
-    summary, detail = summaries.get(state, (state, "Power Guard 正在重新计算当前状态。"))
+    next_steps = {
+        "disarmed": f"保存规则后，启用本次自动{action_name}。",
+        "armed_waiting_for_task": "开始一个新的 Hermes 任务。",
+        "running": "无需操作；所有工作结束后自动继续。",
+        "waiting_for_desktop_ui": "重新打开 Power Guard 页面或恢复 Desktop 连接。",
+        "waiting_for_terminal_signal": "保持唤醒，等待 Hermes 给出明确结果。",
+        "terminal_not_eligible": "查看记录，或修改任务结果规则后重新启用。",
+        "waiting_for_protected_process": "关闭受保护程序，或从规则中移除它。",
+        "waiting_for_idle_check": "恢复 Windows 输入检测后自动继续。",
+        "waiting_for_user_idle": "停止键鼠操作后自动继续。",
+        "armed_waiting_for_quiet": "无需操作；确认期会重新开始。",
+        "quiescence": "无需操作；确认完成后进入倒计时。",
+        "snoozed": "可以取消延后，或等待到期。",
+        "countdown": f"需要时点击“取消{action_name}”。",
+        "executing": "无需操作。",
+        "action_requested": "如果系统没有执行，请查看 Windows 电源设置或应用阻止原因。",
+        "action_complete": "本次自动流程已结束。",
+        "expired": "需要时重新启用。",
+        "error": "查看错误记录并手动重新启用；不会自动重试。",
+        "waiting_for_desktop_backend": "在本机 Hermes Desktop 中保持控制面板在线。",
+    }
+    summary, detail = summaries.get(state, ("状态无法识别", "电脑保持唤醒；请查看记录。"))
     return {
         "state": state,
         "summary": summary,
         "detail": detail,
+        "next": next_steps.get(state, "保持唤醒并查看记录。"),
         "active_total": active_total,
+        "counts": {
+            "turns": active_tasks,
+            "background": background,
+            "delegations": delegations,
+            "desktop_busy": desktop_busy,
+        },
         "terminal_count": terminal_count,
         "gates": gates,
     }
@@ -2004,6 +2109,7 @@ def get_status(include_events: bool = True) -> Dict[str, Any]:
             "user_idle_detection": idle is not None,
             "snooze_supported": True,
             "decision_explanation_supported": True,
+            "ui_contract_version": 2,
             **power_capabilities,
             "db_path": str(DB_PATH),
         },

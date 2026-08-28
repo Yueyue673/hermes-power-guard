@@ -1,166 +1,103 @@
 # Hermes Power Guard
 
-[![CI](https://github.com/Yueyue673/hermes-power-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/Yueyue673/hermes-power-guard/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Yueyue673/hermes-power-guard)](https://github.com/Yueyue673/hermes-power-guard/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Hermes Power Guard — wait for Hermes work, show the countdown, then request sleep](assets/hero.svg)
 
-**Safely put Windows to sleep after Hermes finishes its observable work.**
+**Put Windows to sleep after Hermes has no observable work left—not after an assistant merely says it is done.**
 
-Power Guard is a unified [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin with a Python lifecycle coordinator and a native Desktop control panel. It watches turns, background terminals, pending completion deliveries, subagents, running cron jobs, approvals, Kanban workers, and visible Desktop busy sessions. A power action is possible only after an explicitly armed, one-shot campaign passes every safety gate.
+Each use requires one confirmation. Power Guard watches the work that starts afterward, explains what is still keeping the PC awake, and shows a countdown you can cancel before it asks Windows to sleep.
 
-> Default action: **Sleep**. Real power actions are Windows-only and require a local Hermes Desktop-managed backend. Tests are simulation-only.
+[Download v0.4.0](https://github.com/Yueyue673/hermes-power-guard/releases/latest) · [Install](#install) · [How it decides](#how-it-decides) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [中文](README.zh-CN.md)
 
-[中文说明](README.zh-CN.md)
-
-## Why this exists
-
-A final assistant message is not proof that a task is finished. Hermes may still have a child agent running, a terminal process alive, a completion event waiting to return to its parent, or an approval that arrived late. Power Guard treats those as state-machine inputs rather than trusting words such as “done”.
-
-## Highlights
-
-- **Explainable seven-gate flow** — see exactly why sleep is not eligible yet.
-- **One-shot arming** — install and restart states are always disarmed.
-- **Post-arm cohort** — only work observed after explicit confirmation can satisfy completion.
-- **Fail-awake sensors** — a broken process/delegation/cron sensor means “unknown”, never zero.
-- **Desktop cancel lease** — losing the visible control panel blocks the action.
-- **Input cancellation** — any keyboard or mouse activity during countdown cancels it, even when the pre-countdown idle gate is disabled.
-- **Race-resistant coordination** — SQLite generations, CAS action claims, per-window heartbeats, and adjacent token checks.
-- **Crash conservatism** — restart disarms; clock jumps and resume gaps restart confirmation; temporary power plans recover conservatively.
-- **Native UX** — presets, collapsible settings, recent evidence, status-bar state, snooze/resume, offline warning, and Hermes `ConfirmDialog`.
-
-## Safety flow
-
-```mermaid
-flowchart LR
-    A[Explicit arm] --> B[New work observed]
-    B --> C[All tracked work terminal]
-    C --> D[Desktop + process safety gates]
-    D --> E[Quiet window]
-    E --> F[Visible countdown]
-    F --> G[Final token + input recheck]
-    G --> H[Windows power request]
-
-    X[New work / input / policy edit / UI loss / clock gap] -. cancel .-> E
-    X -. cancel .-> F
-    X -. abort .-> G
-```
-
-Formal behavior and trust boundaries are documented in [Architecture](docs/ARCHITECTURE.md) and [Threat model](docs/THREAT-MODEL.md).
+![Power Guard overview while one session and one subagent are still active](assets/ui-preview.svg)
 
 ## Install
 
-### Windows PowerShell
+Windows PowerShell:
 
 ```powershell
 git clone https://github.com/Yueyue673/hermes-power-guard.git "$env:LOCALAPPDATA\hermes\plugins\power-guard"
 hermes plugins enable power-guard --no-allow-tool-override
 ```
 
-Then restart Hermes Desktop once and enable **Power Guard** in **Settings → Plugins**. The Python/API half and Desktop UI half have separate enable gates.
+Restart Hermes Desktop once. In **Settings → Plugins**, enable **Power Guard**. The Python plugin and Desktop UI have separate switches; both must be on. Installation never enables automatic sleep.
 
-### Installer script
+Already cloned elsewhere? Run `python scripts/install.py`.
 
-Clone anywhere, then run:
+## How it decides
 
-```bash
-python scripts/install.py
+### It waits for work, not words
+
+A final chat reply is not enough. Active Hermes sessions, background terminals, pending completion deliveries, subagents, running cron jobs, busy Desktop windows, and protected applications can all keep the PC awake.
+
+### It stays awake when evidence is missing
+
+If a required sensor, task result, input reading, or Desktop connection is unknown, Power Guard does not continue toward sleep. A restart also cancels the current one-shot rule.
+
+### It cancels when you return
+
+Keyboard or mouse input during the countdown cancels it. New Hermes work, a rule change, an offline control panel, or a clock/resume gap also restarts the checks.
+
+## The path to sleep
+
+```text
+Confirm this one use
+  → observe a new Hermes task
+  → wait for every tracked item to finish
+  → check Desktop, input, and protected applications
+  → watch briefly for late work
+  → show a cancelable countdown
+  → check tasks and input one last time
+  → ask Windows to sleep once
 ```
 
-The script copies only plugin source files into the active `HERMES_HOME`, enables the Python plugin through the Hermes CLI, and never arms a campaign.
+The sleep request is non-forced. Windows or an application may reject it to protect unsaved work. Power Guard reports the rejection and does not retry automatically.
 
 ## Use
 
-1. Open **自动睡眠 / Power Guard** from the Desktop sidebar.
-2. Choose a preset or adjust the policy.
-3. Save settings.
-4. Select **Check and confirm automatic sleep**.
-5. Review the exact action, terminal rule, idle threshold, quiet window, countdown, and expiry.
-6. Confirm arming.
+Open **Power Guard** from the Desktop sidebar.
 
-Arming does not act immediately. At least one new task must start afterward.
+- **Overview** shows the current conclusion, evidence, next event, and one primary action.
+- **Rules** controls what counts as finished and how long confirmation takes.
+- **Energy** controls power use while Hermes is still working.
+- **History** shows task results and state changes.
 
-### Commands
+Save the rule, then select **Enable this automatic sleep**. It will not act on work that started before confirmation.
+
+Inspection and simulation commands:
 
 ```text
 /power-guard status
-/power-guard arm
 /power-guard cancel
 /power-guard snooze 15
 /power-guard resume
 /power-guard test 8
-/power-guard display-off
 ```
 
-Real power actions remain restricted to the local Desktop-managed backend. CLI commands are useful for inspection and simulation.
+## Compatibility and boundary
 
-## What is observed
+| | Boundary |
+|---|---|
+| Real power actions | Windows; local Hermes Desktop-managed backend |
+| Default action | Non-forced sleep |
+| Work that can finish the rule | Active-profile work observed after confirmation |
+| Work that can block it | Connected Desktop sessions, background processes, subagents, running cron jobs, protected applications, unknown sensors |
+| Automated tests | Simulation only; no real power action |
+| Interface language | Chinese in v0.4; English documentation included |
 
-Completion cohort:
+A separate remote backend or detached profile that is not connected to the current Desktop cannot be proven idle. Power Guard does not claim to cover it.
 
-- turns in the active Hermes profile, observed after arming;
-- Kanban workers observed by the plugin;
-- structured completion/blocking lifecycle signals.
+## Project documents
 
-Global safety vetoes in the connected Desktop runtime:
-
-- active/background terminal processes;
-- pending completion deliveries;
-- async subagents;
-- currently running cron jobs;
-- visible Desktop busy sessions/windows;
-- configured protected executables;
-- missing/failed required sensors.
-
-### Scope boundary
-
-A completely separate remote backend or detached Hermes profile that is not connected to the current Desktop cannot be proven idle. Power Guard does not claim otherwise. The current implementation uses visible Desktop busy state as a cross-session veto and the active profile as the completion cohort.
-
-## Default policy
-
-| Setting | Default |
-|---|---:|
-| Action | Sleep |
-| Terminal rule | Completed or structured blocker |
-| Manual interruption | Not eligible |
-| Text blocker heuristic | Off |
-| User idle before countdown | 5 minutes |
-| Quiet window | 30 seconds |
-| Visible countdown | 90 seconds |
-| Arm expiry | 12 hours |
-| Dry run | Off |
-
-Sleep uses `SetSuspendState(..., ForceCritical=False, ...)`, allowing Windows or an application to veto suspension to protect unsaved work.
-
-## Development
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v
-python -m py_compile power_guard_core.py __init__.py dashboard/plugin_api.py
-node --check desktop/plugin.js
-```
-
-Inside a Hermes installation, also run:
-
-```bash
-hermes plugins doctor . --ci
-```
-
-The test suite never invokes a real power action. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Current verification
-
-Version `0.3.0` was locally verified with:
-
-- 40 unit/API/concurrency/safety tests;
-- Python compile checks;
-- Desktop ESM syntax check;
-- Hermes Plugin Doctor (12 lifecycle hooks);
-- a real isolated `hermes serve` API path;
-- simulated countdown result: `SIMULATED sleep`.
-
-No real sleep, shutdown, hibernate, lock, or display-off action is performed by the automated test suite.
-
-## License
+- [Product design](DESIGN.md)
+- [Benchmarks](docs/BENCHMARKS.md)
+- [State matrix](docs/STATE-MATRIX.md)
+- [Product language](docs/PRODUCT-LANGUAGE.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Threat model](docs/THREAT-MODEL.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Compatibility](docs/COMPATIBILITY.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
 
 MIT — see [LICENSE](LICENSE).

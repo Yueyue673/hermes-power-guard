@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-08-28
+
+### Product design
+
+- Rebuilt the Desktop page around four focused views: Overview, Rules, Energy, and History.
+- Replaced the card/metric wall with one current conclusion, one primary action, flat evidence, and progressively disclosed conditions.
+- Rewrote runtime language around state, evidence, next event, and action; removed internal lifecycle jargon from the primary UI.
+- Split end-of-work policy from during-work energy controls.
+- Added a committed product design direction, benchmark evidence, state matrix, and language contract.
+
+### Project presentation
+
+- Replaced the long engineering-first README with a concise product entry in English and Chinese.
+- Added a restrained project hero and faithful UI preview.
+- Added compatibility and troubleshooting documentation plus structured issue and pull-request templates.
+
+### Compatibility
+
+- Added Desktop UI contract version 2 for precise decision copy and compatibility notices.
+
 ## [0.3.0] - 2026-08-28
 
 ### Added

@@ -1,8 +1,8 @@
 manifest_version: 2
 api_version: 1
 name: power-guard
-version: 0.3.0
-description: "Safely sleep or power down Windows after observed Hermes work is complete or blocked, with an explainable native control panel and energy-saving gates."
+version: 0.4.0
+description: "Wait for Hermes sessions, background processes, and subagents to finish; show a cancelable countdown; then request a Windows power action."
 author: "Yueyue673"
 license: MIT
 tags: [automation, power, windows, desktop, safety]

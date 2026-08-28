@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -207,9 +208,15 @@ class PowerGuardCoreTests(unittest.TestCase):
 
     def test_decision_snapshot_explains_current_gate(self):
         status = self.arm_ready({"require_user_idle": False})
+        self.assertEqual(status["capabilities"]["ui_contract_version"], 2)
         self.assertEqual(status["decision"]["state"], "armed_waiting_for_task")
-        self.assertEqual(status["decision"]["summary"], "等待新任务")
+        self.assertEqual(status["decision"]["summary"], "等待启用后的第一个任务")
+        self.assertEqual(status["decision"]["next"], "开始一个新的 Hermes 任务。")
         self.assertEqual(len(status["decision"]["gates"]), 7)
+        visible_copy = json.dumps(status["decision"], ensure_ascii=False)
+        self.assertNotIn("武装", visible_copy)
+        self.assertNotIn("安全门", visible_copy)
+        self.assertNotIn("终态", visible_copy)
 
     def test_new_turn_can_abort_a_claim_before_os_call(self):
         self.arm_ready({"require_user_idle": False, "quiescence_seconds": 30, "dry_run": False})
