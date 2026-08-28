@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/Yueyue673/hermes-power-guard/security/policy
+    about: Report a power-action bypass privately.
+  - name: Hermes Agent documentation
+    url: https://hermes-agent.nousresearch.com/docs
+    about: Check Hermes installation and plugin documentation.

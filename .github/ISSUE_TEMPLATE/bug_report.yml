@@ -1,0 +1,55 @@
+name: Bug report
+description: Report incorrect eligibility, UI state, or installation behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not use a real power action to reproduce a bug. Use simulation mode whenever possible.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Power Guard, Hermes Agent, and Windows versions
+      placeholder: "Power Guard 0.4.0; Hermes 0.x; Windows 11 24H2"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Eligibility / task tracking
+        - Countdown / cancellation
+        - Desktop UI
+        - Sleep or Windows power API
+        - Installation / update
+        - Energy controls
+    validations:
+      required: true
+  - type: textarea
+    id: sequence
+    attributes:
+      label: Exact sequence
+      description: What was armed, which work was active, which state appeared, and what happened next?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Safe evidence
+      description: Sanitized event history, screenshots, or simulation output. Remove tokens, paths, and private task text.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I did not intentionally trigger a real sleep/shutdown to create this report.
+          required: true

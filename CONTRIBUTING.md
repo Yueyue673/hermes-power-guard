@@ -28,6 +28,8 @@ hermes plugins doctor . --ci
 
 ## Pull requests
 
+Before changing UI or product copy, read [DESIGN.md](DESIGN.md) and [Product language](docs/PRODUCT-LANGUAGE.md).
+
 - Keep changes focused.
 - Add a regression test for behavior changes.
 - Describe safety impact and rollback behavior.

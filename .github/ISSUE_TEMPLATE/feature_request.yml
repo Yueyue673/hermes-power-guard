@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a safer or clearer Power Guard behavior
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: situation
+    attributes:
+      label: Situation
+      description: What are you trying to leave running, and what evidence should Power Guard use?
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed behavior
+      description: Include the visible state, cancellation path, and failure behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety impact
+      description: Could this make a false sleep more likely? What unknown state should block it?
+    validations:
+      required: true
