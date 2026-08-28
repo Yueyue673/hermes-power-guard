@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+*.db
+.coverage
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example

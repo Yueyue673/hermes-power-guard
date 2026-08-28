@@ -1,0 +1,7 @@
+{
+  "name": "power-guard",
+  "label": "Power Guard",
+  "description": "Backend for the Hermes Desktop automatic power-action control panel.",
+  "version": "0.3.0",
+  "api": "plugin_api.py"
+}
