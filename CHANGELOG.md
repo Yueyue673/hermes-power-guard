@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.2] - 2026-08-29
+
+### Safety hardening
+
+- Define the arm boundary after all pre-arm registry sampling and keep external sensor calls outside SQLite write transactions.
+- Baseline only long-running terminal processes; cron runs, subagents, and completion deliveries always remain blockers.
+- Track baseline units and process start times so work appearing after the arm boundary cannot be hidden by a stable identity.
+- Resample live background registries during the final adjacent safety check instead of trusting only the preceding heartbeat.
+- Repeat action/simulation, task, background, Desktop-busy, protected-process, and user-input checks in the token micro-check immediately before the OS call.
+- Add an arm request token so concurrent cancel/settings changes win, and migrate tasks that start while the pre-arm sample is running into the new generation.
+- Move protected-process and active-power-plan probes outside SQLite write transactions.
+- Preserve an existing explicit `wait_all` policy because 0.4.0 did not record whether it came from a preset or a deliberate strict choice.
+
 ## [0.4.1] - 2026-08-28
 
 ### Fixed

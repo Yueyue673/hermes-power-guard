@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -343,7 +344,7 @@ class PowerGuardCoreTests(unittest.TestCase):
             )
         armed = self.arm_ready({"require_user_idle": False, "quiescence_seconds": 0})
         self.assertEqual(armed["settings"]["background_process_policy"], "wait_new")
-        self.assertIn("process:preview", armed["runtime"]["background_baseline_ids"])
+        self.assertEqual(armed["runtime"]["background_baseline"]["process:preview"], 1)
         self.terminal_task()
         core._evaluate()
         status = core.get_status()
@@ -357,7 +358,7 @@ class PowerGuardCoreTests(unittest.TestCase):
                 (time.time(),),
             )
         core._evaluate()
-        self.assertNotIn("process:preview", core.get_status()["runtime"]["background_baseline_ids"])
+        self.assertEqual(core.get_status()["runtime"]["background_baseline"]["process:preview"], 1)
 
         restarted = json.dumps([
             {
@@ -379,18 +380,15 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(restarted_status["runtime"]["state"], "running")
         self.assertEqual(restarted_status["runtime"]["active_background_processes"], 1)
 
-    def test_040_wait_all_default_migrates_once_to_campaign_scope(self):
+    def test_040_explicit_wait_all_is_preserved(self):
         with core._connect() as conn:
             settings = core._meta_get(conn, "settings")
             settings["background_process_policy"] = "wait_all"
             core._meta_set(conn, "settings", settings)
             conn.execute("DELETE FROM meta WHERE key='migration_background_policy_041'")
-        self.assertEqual(core.get_settings()["background_process_policy"], "wait_new")
-        with core._connect() as conn:
-            stored = core._meta_get(conn, "settings")
-            stored["background_process_policy"] = "wait_all"
-            core._meta_set(conn, "settings", stored)
         self.assertEqual(core.get_settings()["background_process_policy"], "wait_all")
+        with core._connect() as conn:
+            self.assertTrue(core._meta_get(conn, "migration_background_policy_041"))
 
     def test_background_process_started_after_arm_still_blocks(self):
         armed = self.arm_ready({"require_user_idle": False, "quiescence_seconds": 0})
@@ -415,6 +413,215 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(status["runtime"]["state"], "running")
         self.assertEqual(status["runtime"]["active_background_processes"], 1)
 
+    def test_preexisting_cron_and_completion_delivery_still_block(self):
+        details = json.dumps([
+            {"source": "cron", "id": "daily", "command": "cron job", "units": 1},
+            {
+                "source": "completion_queue",
+                "id": "pending",
+                "command": "pending completion delivery",
+                "units": 1,
+            },
+        ])
+        with core._connect() as conn:
+            conn.execute(
+                "INSERT INTO heartbeats(owner_instance,owner_pid,updated_at,active_processes,active_delegations,process_details) "
+                "VALUES('worker',999,?,1,1,?)",
+                (time.time(), details),
+            )
+        armed = self.arm_ready({"require_user_idle": False, "quiescence_seconds": 0})
+        self.assertEqual(armed["runtime"]["background_baseline"], {})
+        self.terminal_task()
+        core._evaluate()
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["state"], "running")
+        self.assertEqual(status["runtime"]["active_background_processes"], 1)
+        self.assertEqual(status["runtime"]["active_delegations"], 1)
+
+    def test_added_units_under_a_baseline_identity_still_block(self):
+        runtime = core._fresh_runtime()
+        runtime["armed_at"] = 100.0
+        runtime["background_baseline"] = {"process:shared": 1}
+        scoped = core._scope_background_details(
+            {**core.DEFAULT_SETTINGS, "background_process_policy": "wait_new"},
+            runtime,
+            [
+                {
+                    "source": "process",
+                    "id": "shared",
+                    "command": "worker group",
+                    "started_at": 99.0,
+                    "units": 2,
+                }
+            ],
+        )
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped[0]["units"], 1)
+
+    def test_unobserved_process_is_not_baselined_by_coarse_timestamp(self):
+        runtime = core._fresh_runtime()
+        runtime["armed_at"] = 100.9
+        runtime["background_baseline"] = {}
+        scoped = core._scope_background_details(
+            {**core.DEFAULT_SETTINGS, "background_process_policy": "wait_new"},
+            runtime,
+            [
+                {
+                    "source": "process",
+                    "id": "unobserved",
+                    "started_at": 100.0,
+                    "units": 1,
+                }
+            ],
+        )
+        self.assertEqual(len(scoped), 1)
+
+    def test_process_start_identity_is_stable_across_samples(self):
+        row = {
+            "started_at": "2026-08-28T23:59:58",
+            "uptime_seconds": 1,
+        }
+        first = core._process_started_at(row, 1000.1)
+        second = core._process_started_at(row, 1000.9)
+        self.assertEqual(first, second)
+
+    def test_arm_samples_live_registries_outside_write_transaction(self):
+        future_start = time.time() + 60
+
+        def sensor(settings, **kwargs):
+            with core._connect() as conn:
+                core._meta_set(conn, "arm_sensor_probe", {"ok": True})
+            return 1, 0, [
+                {
+                    "source": "process",
+                    "id": "raced-process",
+                    "command": "python worker.py",
+                    "started_at": future_start,
+                    "units": 1,
+                }
+            ]
+
+        with mock.patch.object(core, "_background_snapshot", side_effect=sensor):
+            armed = self.arm_ready({"require_user_idle": False})
+        self.assertNotIn("process:raced-process", armed["runtime"]["background_baseline"])
+        with core._connect() as conn:
+            self.assertEqual(core._meta_get(conn, "arm_sensor_probe"), {"ok": True})
+
+    def test_cancel_wins_against_inflight_arm(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_sensor(settings, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return 0, 0, []
+
+        core.record_ui_heartbeat()
+        errors = []
+
+        def arm_worker():
+            try:
+                core.arm({"require_user_idle": False})
+            except Exception as exc:  # expected cancellation result
+                errors.append(exc)
+
+        with mock.patch.object(core, "_background_snapshot", side_effect=slow_sensor):
+            worker = threading.Thread(target=arm_worker)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            cancelled = core.cancel("concurrent-user-cancel")
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(cancelled["settings"]["armed"])
+        self.assertEqual(cancelled["runtime"]["state"], "disarmed")
+        self.assertTrue(any(isinstance(exc, RuntimeError) for exc in errors))
+        final = core.get_status()
+        self.assertFalse(final["settings"]["armed"])
+        self.assertEqual(final["runtime"]["state"], "disarmed")
+
+    def test_settings_change_wins_against_inflight_arm(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_sensor(settings, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return 0, 0, []
+
+        core.record_ui_heartbeat()
+        errors = []
+
+        def arm_worker():
+            try:
+                core.arm({"require_user_idle": False})
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(core, "_background_snapshot", side_effect=slow_sensor):
+            worker = threading.Thread(target=arm_worker)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            updated = core.update_settings({"user_idle_seconds": 777})
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(updated["user_idle_seconds"], 777)
+        self.assertTrue(any(isinstance(exc, RuntimeError) for exc in errors))
+        final = core.get_status()
+        self.assertFalse(final["settings"]["armed"])
+        self.assertEqual(final["settings"]["user_idle_seconds"], 777)
+
+    def test_turn_started_during_arm_sampling_joins_new_generation(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        # Reuse the same turn identity so started_at remains historical under
+        # the UPSERT; arm must use the boundary update, not only started_at.
+        core.record_turn_start(
+            session_id="boundary-session",
+            task_id="boundary-task",
+            turn_id="boundary-turn",
+            platform_name="desktop",
+        )
+        core.finish_turn(
+            session_id="boundary-session",
+            task_id="boundary-task",
+            turn_id="boundary-turn",
+            completed=True,
+            turn_exit_reason="text_response(stop)",
+        )
+
+        def slow_sensor(settings, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return 0, 0, []
+
+        core.record_ui_heartbeat()
+        result = []
+        with mock.patch.object(core, "_background_snapshot", side_effect=slow_sensor):
+            worker = threading.Thread(
+                target=lambda: result.append(core.arm({"require_user_idle": False}))
+            )
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            core.record_turn_start(
+                session_id="boundary-session",
+                task_id="boundary-task",
+                turn_id="boundary-turn",
+                platform_name="desktop",
+            )
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        status = result[0]
+        self.assertTrue(status["settings"]["armed"])
+        self.assertTrue(status["runtime"]["activity_seen"])
+        self.assertEqual(status["runtime"]["state"], "running")
+        with core._connect() as conn:
+            task_generation = int(conn.execute("SELECT generation FROM tasks").fetchone()[0])
+        self.assertEqual(task_generation, status["runtime"]["generation"])
+
     def test_other_desktop_profile_busy_state_blocks_countdown(self):
         self.arm_ready({"require_user_idle": False, "quiescence_seconds": 30})
         self.terminal_task()
@@ -423,6 +630,23 @@ class PowerGuardCoreTests(unittest.TestCase):
         status = core.get_status()
         self.assertEqual(status["runtime"]["state"], "running")
         self.assertEqual(status["runtime"]["desktop_busy_count"], 2)
+
+    def test_protected_process_scan_runs_outside_write_transaction(self):
+        self.arm_ready({
+            "require_user_idle": False,
+            "protected_processes": ["obs64.exe"],
+        })
+        self.terminal_task()
+
+        def scanner(names):
+            with core._connect() as conn:
+                core._meta_set(conn, "protected_scan_probe", {"ok": True})
+            return ["obs64.exe"], True
+
+        with mock.patch.object(core, "_protected_processes_running", side_effect=scanner):
+            core._evaluate()
+        with core._connect() as conn:
+            self.assertEqual(core._meta_get(conn, "protected_scan_probe"), {"ok": True})
 
     def test_waiting_input_times_out_to_blocked(self):
         self.arm_ready({"require_user_idle": False, "waiting_input_timeout_seconds": 60, "quiescence_seconds": 0})
@@ -598,6 +822,22 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(runtime["power_plan_applied"], "")
         self.assertEqual(runtime["power_plan_previous"], "")
 
+    def test_power_plan_probe_runs_outside_write_transaction(self):
+        settings = {**core.get_settings(), "power_plan": "balanced"}
+        previous = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+
+        def current_plan():
+            with core._connect() as conn:
+                core._meta_set(conn, "power_plan_probe", {"ok": True})
+            return previous
+
+        with mock.patch.object(core, "_current_power_plan", side_effect=current_plan), mock.patch.object(
+            core, "_set_power_plan", return_value=(True, core.POWER_PLAN_GUIDS["balanced"])
+        ):
+            core._manage_global_power_plan_locked(settings, True)
+        with core._connect() as conn:
+            self.assertEqual(core._meta_get(conn, "power_plan_probe"), {"ok": True})
+
     def test_cancel_never_clears_execution_state_from_api_thread(self):
         self.arm_ready({"require_user_idle": False})
         with mock.patch.object(core, "_set_execution_state") as execution_state:
@@ -636,8 +876,46 @@ class PowerGuardCoreTests(unittest.TestCase):
         claim = {"token": token, "action": "sleep", "simulate": False}
         with mock.patch.object(core.time, "sleep"), mock.patch.object(
             core, "_user_idle_seconds", return_value=600
-        ), mock.patch.object(core, "_protected_processes_running", return_value=([], True)):
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ), mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, json.loads(details))
+        ):
             self.assertTrue(core._claim_still_safe(claim))
+
+    def test_final_safety_check_resamples_live_background_work(self):
+        armed = self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        token = "late-background-token"
+        with core._connect() as conn:
+            runtime = core._meta_get(conn, "runtime")
+            runtime.update({
+                "state": "executing",
+                "countdown_token": token,
+                "action_claimed_by": core.PROCESS_INSTANCE,
+                "countdown_last_input_at": time.time() - 60,
+                "ui_heartbeat_at": time.time(),
+            })
+            core._meta_set(conn, "runtime", runtime)
+        late_details = [
+            {
+                "source": "process",
+                "id": "late-worker",
+                "command": "python worker.py",
+                "started_at": float(armed["runtime"]["armed_at"]) + 1,
+                "units": 1,
+            }
+        ]
+        claim = {"token": token, "action": "sleep", "simulate": False}
+        with mock.patch.object(core.time, "sleep"), mock.patch.object(
+            core, "_user_idle_seconds", return_value=600
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ), mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, late_details)
+        ):
+            self.assertFalse(core._claim_still_safe(claim))
+        self.assertEqual(core.get_status()["runtime"]["state"], "disarmed")
 
     def test_preexisting_daemon_reaches_real_sleep_request_boundary(self):
         details = json.dumps([
@@ -674,9 +952,18 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertFalse(claim["simulate"])
         with mock.patch.object(core.time, "sleep"), mock.patch.object(
             core, "_user_idle_seconds", return_value=600
-        ), mock.patch.object(core, "_protected_processes_running", return_value=([], True)):
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ), mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, json.loads(details))
+        ):
             self.assertTrue(core._claim_still_safe(claim))
-        self.assertTrue(core._claim_token_is_current(claim))
+        with mock.patch.dict(os.environ, {"POWER_GUARD_TEST_MODE": "0"}, clear=False), mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, json.loads(details))
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ):
+            self.assertTrue(core._claim_token_is_current(claim))
         with mock.patch.object(
             core, "_execute_power_action", return_value=(True, "Sleep requested")
         ) as execute:
@@ -694,9 +981,72 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.make_due()
         with mock.patch.dict(os.environ, {"HERMES_DESKTOP": "1"}, clear=False):
             claim = core._evaluate()
-        self.assertTrue(core._claim_token_is_current(claim))
-        core.record_external_activity("late-cancel")
-        self.assertFalse(core._claim_token_is_current(claim))
+        with mock.patch.object(
+            core, "_background_snapshot", return_value=(0, 0, [])
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ):
+            self.assertTrue(core._claim_token_is_current(claim))
+            core.record_external_activity("late-cancel")
+            self.assertFalse(core._claim_token_is_current(claim))
+
+    def test_settings_change_after_final_safety_check_invalidates_claim(self):
+        self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        self.enter_countdown()
+        self.make_due()
+        with mock.patch.dict(os.environ, {"HERMES_DESKTOP": "1"}, clear=False):
+            claim = core._evaluate()
+        core.update_settings({"action": "lock", "dry_run": True})
+        with mock.patch.object(
+            core, "_background_snapshot", return_value=(0, 0, [])
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ):
+            self.assertFalse(core._claim_token_is_current(claim))
+        status = core.get_status()
+        self.assertEqual(status["runtime"]["state"], "disarmed")
+        self.assertEqual(status["settings"]["action"], "lock")
+        self.assertTrue(status["settings"]["dry_run"])
+
+    def test_background_start_after_final_safety_check_invalidates_claim(self):
+        armed = self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        self.enter_countdown()
+        self.make_due()
+        with mock.patch.dict(os.environ, {"HERMES_DESKTOP": "1"}, clear=False):
+            claim = core._evaluate()
+        late_details = [
+            {
+                "source": "process",
+                "id": "micro-race-worker",
+                "started_at": float(armed["runtime"]["armed_at"]) + 1,
+                "units": 1,
+            }
+        ]
+        with mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, late_details)
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ):
+            self.assertFalse(core._claim_token_is_current(claim))
+        self.assertEqual(core.get_status()["runtime"]["state"], "disarmed")
+
+    def test_desktop_busy_after_final_safety_check_invalidates_claim(self):
+        self.arm_ready({"require_user_idle": False, "dry_run": False})
+        self.terminal_task()
+        self.enter_countdown()
+        self.make_due()
+        with mock.patch.dict(os.environ, {"HERMES_DESKTOP": "1"}, clear=False):
+            claim = core._evaluate()
+        core.record_ui_heartbeat(busy_count=1, instance_id="late-busy-window")
+        with mock.patch.object(
+            core, "_background_snapshot", return_value=(0, 0, [])
+        ), mock.patch.object(
+            core, "_protected_processes_running", return_value=([], True)
+        ):
+            self.assertFalse(core._claim_token_is_current(claim))
+        self.assertEqual(core.get_status()["runtime"]["state"], "disarmed")
 
 
 if __name__ == "__main__":
