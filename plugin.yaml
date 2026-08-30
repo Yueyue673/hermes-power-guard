@@ -1,7 +1,7 @@
 manifest_version: 2
 api_version: 1
 name: power-guard
-version: 0.4.1
+version: 0.4.2
 description: "Wait for Hermes sessions, background processes, and subagents to finish; show a cancelable countdown; then request a Windows power action."
 author: "Yueyue673"
 license: MIT

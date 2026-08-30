@@ -42,7 +42,17 @@ async def settings(body: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.post("/arm")
 async def arm(body: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    return core.arm(body or {})
+    payload = dict(body or {})
+    current_session_id = str(payload.pop("current_session_id", "") or "")
+    raw_session_ids = payload.pop("current_session_ids", [])
+    current_session_ids = [str(value) for value in raw_session_ids] if isinstance(raw_session_ids, list) else []
+    current_profile = str(payload.pop("current_profile", "") or "")
+    return core.arm(
+        payload,
+        current_session_id=current_session_id,
+        current_session_ids=current_session_ids,
+        current_profile=current_profile,
+    )
 
 
 @router.post("/cancel")

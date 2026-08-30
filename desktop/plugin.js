@@ -173,7 +173,7 @@ function conclusionFor(status) {
   if (!settings.armed) return {
     tone: 'muted', title: `自动${action}未启用`,
     evidence: `当前不会执行任何自动电源动作。${evidence}`,
-    next: '确认规则后，可以只为接下来开始的新任务启用一次。'
+    next: '启用时会优先接管正在运行的当前会话；没有当前任务时才等待下一个。'
   }
   if (runtime.state === 'countdown') return {
     tone: 'warn', title: `${formatSeconds(runtime.countdown_remaining_seconds)}后将${action}`,
@@ -479,7 +479,7 @@ function HistoryView({ status }) {
           jsx('span', { className: 'truncate text-(--ui-text-tertiary)', children: task.reason || '等待结果' })
         ] }),
         jsx(Badge, { variant: task.outcome === 'failed' ? 'destructive' : task.outcome === 'unknown' ? 'warn' : 'muted', children: outcome(task.outcome) })
-      ] }, task.task_key)) }) : jsx('p', { className: 'mt-3 text-sm text-(--ui-text-tertiary)', children: '启用后开始的新任务会显示在这里。' })
+      ] }, task.task_key)) }) : jsx('p', { className: 'mt-3 text-sm text-(--ui-text-tertiary)', children: '接管的当前任务或启用后开始的新任务会显示在这里。' })
     ] }),
     jsxs('section', { children: [
       jsx('h2', { className: 'text-base font-semibold text-(--ui-text-primary)', children: '状态记录' }),
@@ -492,9 +492,12 @@ function HistoryView({ status }) {
   ] })
 }
 
-function ArmConfirmation({ draft }) {
+function ArmConfirmation({ draft, currentSessionBusy }) {
   return jsxs('div', { className: 'flex flex-col gap-2 text-xs leading-5 text-(--ui-text-secondary)', children: [
-    jsx('p', { children: `确认后不会立即${ACTION_LABELS[draft.action] || draft.action}，只观察确认后开始的新任务。` }),
+    jsx('p', { className: 'font-medium text-(--ui-text-primary)', children: currentSessionBusy
+      ? '已检测到当前会话正在运行：确认后立即接管，等它及关联后台工作结束。'
+      : '当前没有正在运行的会话：确认后等待下一个任务开始。' }),
+    jsx('p', { children: `确认后不会立即${ACTION_LABELS[draft.action] || draft.action}。无关的旧预览服务不会被误算为当前项目。` }),
     jsx('p', { children: `任务结果：${draft.trigger_mode === 'done_only' ? '仅全部成功' : '完成或明确无法继续'}。` }),
     jsx('p', { children: `键鼠空闲：${draft.require_user_idle ? formatSeconds(draft.user_idle_seconds) : '不作为进入门槛'}；迟到任务检查 ${formatSeconds(draft.quiescence_seconds)}；倒计时 ${formatSeconds(draft.countdown_seconds)}。` }),
     jsx('p', { children: `本次操作将在 ${formatSeconds((draft.arm_expiry_minutes || 720) * 60)}后自动取消；重启 Hermes 也会取消。` }),
@@ -514,6 +517,21 @@ function OfflineBanner({ onRetry }) {
 
 function PowerGuardPage() {
   const queryClient = useQueryClient()
+  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const focusedSessionProfile = useValue(host.state.focusedSessionProfile)
+  const busyBySession = useValue(host.state.busyBySession)
+  const rememberedScope = pluginContext?.storage.get('last-focused-session', { id: '', profile: '' }) || { id: '', profile: '' }
+  const busySessionIds = Object.entries(busyBySession || {}).filter(([, busy]) => Boolean(busy)).map(([id]) => id)
+  const preferredSessionId = focusedSessionId && busyBySession?.[focusedSessionId]
+    ? focusedSessionId
+    : rememberedScope.id && busyBySession?.[rememberedScope.id]
+      ? rememberedScope.id
+      : ''
+  const scopeSessionIds = [...new Set([preferredSessionId, ...busySessionIds].filter(Boolean))]
+  const currentSessionBusy = scopeSessionIds.length > 0
+  const scopeProfile = scopeSessionIds.length === 1
+    ? (scopeSessionIds[0] === focusedSessionId ? focusedSessionProfile : rememberedScope.profile || '')
+    : ''
   const statusQuery = useQuery({ queryFn: () => request('/status'), queryKey: QUERY_KEY, refetchInterval: 2000 })
   const [view, setView] = useState('overview')
   const [draft, setDraft] = useState(null)
@@ -539,8 +557,18 @@ function PowerGuardPage() {
     onError: error => host.notifyError(error, 'Power Guard 规则保存失败')
   })
   const armMutation = useMutation({
-    mutationFn: () => request('/arm', { method: 'POST', body: {} }),
-    onSuccess: data => { refreshSettings(data); host.notify({ kind: 'success', title: '本次自动操作已启用', message: `只会跟踪现在之后开始的新任务；满足条件后自动${ACTION_LABELS[data.settings.action] || data.settings.action}。` }) },
+    mutationFn: () => request('/arm', { method: 'POST', body: { current_session_id: scopeSessionIds[0] || '', current_session_ids: scopeSessionIds, current_profile: scopeProfile } }),
+    onSuccess: data => {
+      refreshSettings(data)
+      const captured = Number(data.runtime?.captured_task_count || 0)
+      host.notify({
+        kind: 'success',
+        title: captured ? '已接管当前项目' : '已等待下一个项目',
+        message: captured
+          ? `已纳入 ${captured} 个正在运行的任务；全部结束并满足条件后自动${ACTION_LABELS[data.settings.action] || data.settings.action}。`
+          : `当前没有运行中任务；下一个任务结束并满足条件后自动${ACTION_LABELS[data.settings.action] || data.settings.action}。`
+      })
+    },
     onError: error => host.notifyError(error, 'Power Guard 启用失败')
   })
   const cancelMutation = useMutation({
@@ -600,7 +628,7 @@ function PowerGuardPage() {
     ] }),
     jsx(ConfirmDialog, {
       cancelLabel: '返回检查规则', confirmLabel: `启用本次自动${ACTION_LABELS[draft.action] || draft.action}`,
-      busyLabel: '正在启用…', description: jsx(ArmConfirmation, { draft }),
+      busyLabel: '正在启用…', description: jsx(ArmConfirmation, { draft, currentSessionBusy }),
       destructive: !draft.dry_run && draft.action === 'shutdown', doneLabel: '已启用',
       onClose: () => setArmConfirmOpen(false), onConfirm: () => armMutation.mutateAsync(),
       open: armConfirmOpen && !status.settings.armed, title: `启用本次自动${ACTION_LABELS[draft.action] || draft.action}?`
@@ -611,9 +639,14 @@ function PowerGuardPage() {
 function PowerGuardStatus() {
   const queryClient = useQueryClient()
   const notifiedToken = useRef('')
+  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const focusedSessionProfile = useValue(host.state.focusedSessionProfile)
   const busyBySession = useValue(host.state.busyBySession)
   const busyCountRef = useRef(0)
   busyCountRef.current = Object.values(busyBySession || {}).filter(Boolean).length
+  useEffect(() => {
+    if (focusedSessionId) pluginContext?.storage.set('last-focused-session', { id: focusedSessionId, profile: focusedSessionProfile || '' })
+  }, [focusedSessionId, focusedSessionProfile])
   useQuery({
     queryFn: () => request('/ui-heartbeat', { method: 'POST', body: { busy_count: busyCountRef.current, instance_id: UI_INSTANCE_ID } }),
     queryKey: ['power-guard', 'ui-heartbeat'], refetchInterval: 2000, retry: false

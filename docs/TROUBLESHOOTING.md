@@ -14,7 +14,7 @@ Open **Overview** and read the current conclusion. Common blockers:
 | 受保护程序仍在运行 | An executable listed under protected applications is active | Close it or remove it from the rule |
 | 读不到后台/键鼠状态 | Required evidence is unavailable | Power Guard stays awake until the sensor recovers |
 
-Power Guard 0.4.0 could count the same process more than once and treated preview servers already running before confirmation as permanent blockers. Upgrade to 0.4.1 and restart Hermes Desktop once. The default rule then waits only for background work started after confirmation.
+Power Guard 0.4.0 could count the same process more than once and treated preview servers already running before confirmation as permanent blockers. Upgrade to 0.4.2 and restart Hermes Desktop once. The default rule then baselines existing terminal servers while keeping cron, subagents, pending deliveries, and newly started processes as blockers.
 
 ## The plugin page says the backend is not loaded
 

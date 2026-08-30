@@ -314,12 +314,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         _meta_set(conn, "settings", DEFAULT_SETTINGS)
         _meta_set(conn, "migration_background_policy_041", True)
     elif _meta_get(conn, "migration_background_policy_041") is None:
-        # 0.4.0 wrote wait_all as the default, so a forgotten preview server
-        # made the common preset impossible to finish. Migrate once; users can
-        # still explicitly choose the strict wait_all policy afterwards.
-        if isinstance(stored_settings, dict) and stored_settings.get("background_process_policy") == "wait_all":
-            stored_settings["background_process_policy"] = "wait_new"
-            _meta_set(conn, "settings", stored_settings)
+        # 0.4.0 did not record whether wait_all came from a preset or an
+        # explicit safety choice. Preserve it rather than silently weakening a
+        # user's strict policy; the Desktop UI exposes wait_new directly.
         _meta_set(conn, "migration_background_policy_041", True)
     if _meta_get(conn, "runtime") is None:
         _meta_set(conn, "runtime", _fresh_runtime())
@@ -331,7 +328,13 @@ def _fresh_runtime() -> Dict[str, Any]:
         "state": "disarmed",
         "armed_at": None,
         "armed_expires_at": None,
-        "background_baseline_ids": [],
+        "arm_request_token": "",
+        "arm_request_started_at": None,
+        "scope_mode": "next",
+        "scope_session_id": "",
+        "scope_session_ids": [],
+        "captured_task_count": 0,
+        "background_baseline": {},
         "activity_seen": False,
         "snooze_until": None,
         "quiet_since": None,
@@ -461,10 +464,17 @@ def update_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
             for key in DEFAULT_SETTINGS
             if key != "armed"
         )
-        if current.get("armed") and policy_changed:
+        if runtime.get("arm_request_token"):
+            runtime["arm_request_token"] = ""
+            runtime["arm_request_started_at"] = None
+            runtime["updated_at"] = _now()
+            _meta_set(conn, "runtime", runtime)
+            _event(conn, "arm_cancelled", "Settings changed while confirmation was being prepared")
+        claim_in_flight = runtime.get("state") == "executing"
+        if policy_changed and (current.get("armed") or claim_in_flight):
             # A confirmed campaign is a snapshot of the exact policy the user
-            # reviewed. Any setting edit invalidates that consent, so disarm and
-            # require the stronger confirmation flow again.
+            # reviewed. This remains true after the claim atomically disarms
+            # settings: edits must still cancel the in-flight OS request.
             updated["armed"] = False
             should_restore = bool(
                 current.get("restore_power_plan") and runtime.get("power_plan_previous")
@@ -479,7 +489,11 @@ def update_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
             runtime["action_claimed_by"] = ""
             runtime["updated_at"] = _now()
             _meta_set(conn, "runtime", runtime)
-            _event(conn, "settings_disarm", "Settings changed; confirmation is required again")
+            _event(
+                conn,
+                "action_aborted" if claim_in_flight else "settings_disarm",
+                "Settings changed; confirmation is required again",
+            )
         else:
             updated["armed"] = current.get("armed", False)
         _meta_set(conn, "settings", updated)
@@ -504,59 +518,191 @@ def _task_key(session_id: str, task_id: str, turn_id: str, profile: str = "") ->
     return f"turn:{digest}:{identity}"
 
 
-def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _active_scope_task_ids(session_id: str, profile: str = "") -> list[str]:
+    if not session_id:
+        return []
+    with _connect() as conn:
+        if profile:
+            rows = conn.execute(
+                "SELECT DISTINCT task_id FROM tasks WHERE session_id=? AND profile=? "
+                "AND status IN ('running','waiting_input') AND task_id<>''",
+                (session_id, profile),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT task_id FROM tasks WHERE session_id=? "
+                "AND status IN ('running','waiting_input') AND task_id<>''",
+                (session_id,),
+            ).fetchall()
+    return [str(row[0]) for row in rows if row[0]]
+
+
+def _scope_process_keys(task_ids: list[str]) -> set[str]:
+    if not task_ids:
+        return set()
+    try:
+        from tools.process_registry import process_registry
+
+        keys: set[str] = set()
+        for task_id in task_ids:
+            for row in process_registry.list_sessions(task_id=task_id):
+                if row.get("status") == "running" and row.get("session_id"):
+                    keys.add(f"process:{row['session_id']}")
+        return keys
+    except Exception:
+        logger.exception("Power Guard could not identify current-project processes")
+        return set()
+
+
+def arm(
+    overrides: Optional[Dict[str, Any]] = None,
+    *,
+    current_session_id: str = "",
+    current_session_ids: Optional[list[str]] = None,
+    current_profile: str = "",
+) -> Dict[str, Any]:
+    request_token = uuid.uuid4().hex
+    request_started_at = _now()
+    current_session_id = str(current_session_id or "")[:240]
+    scope_session_ids = []
+    for value in [current_session_id, *(current_session_ids or [])]:
+        normalized = str(value or "")[:240]
+        if normalized and normalized not in scope_session_ids:
+            scope_session_ids.append(normalized)
+    current_session_id = scope_session_ids[0] if scope_session_ids else ""
+    current_profile = str(current_profile or "")[:120]
+    arm_cancelled = False
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        settings_snapshot = validate_settings(_meta_get(conn, "settings") or {})
+        if overrides:
+            settings_snapshot = validate_settings(overrides, base=settings_snapshot)
+        runtime = _meta_get(conn, "runtime") or _fresh_runtime()
+        runtime["arm_request_token"] = request_token
+        runtime["arm_request_started_at"] = request_started_at
+        runtime["updated_at"] = request_started_at
+        _meta_set(conn, "runtime", runtime)
+        _event(conn, "arm_preparing", "Sampling pre-existing background work")
+        conn.commit()
+
+    # Sample outside the write transaction. The effective arm boundary is the
+    # moment after this snapshot: anything observed here is pre-arm; anything
+    # starting afterwards must block. Holding BEGIN IMMEDIATE while calling
+    # live registries can stall cancellation and UI heartbeats.
+    observed_details: list[Dict[str, Any]] = []
+    if settings_snapshot.get("background_process_policy") == "wait_new":
+        sample_now = _now()
+        cutoff = sample_now - int(settings_snapshot.get("stale_heartbeat_seconds") or 20)
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT process_details FROM heartbeats WHERE updated_at>=?",
+                (cutoff,),
+            ).fetchall()
+        for row in rows:
+            try:
+                row_details = json.loads(row["process_details"] or "[]")
+            except (TypeError, ValueError):
+                row_details = []
+            observed_details.extend(item for item in row_details if isinstance(item, dict))
+        _, _, local_details = _background_snapshot(
+            settings_snapshot,
+            include_preexisting=True,
+        )
+        observed_details.extend(local_details)
+    scope_task_ids = sorted({
+        task_id
+        for session_id in scope_session_ids
+        for task_id in _active_scope_task_ids(session_id, current_profile)
+    })
+    scope_process_keys = _scope_process_keys(scope_task_ids)
+    armed_at = _now()
+    baseline: Dict[str, int] = {}
+    for item in observed_details:
+        if _background_detail_key(item).split(":", 1)[0] != "process":
+            continue
+        started_at = item.get("started_at")
+        if started_at is not None:
+            try:
+                if float(started_at) > armed_at:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        key = _background_detail_key(item)
+        if key in scope_process_keys:
+            # Existing terminals launched by the current project belong to the
+            # captured cohort; unlike unrelated old daemons, they must finish.
+            continue
+        baseline[key] = max(baseline.get(key, 0), max(1, int(item.get("units") or 1)))
+
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         settings = validate_settings(_meta_get(conn, "settings") or {})
         if overrides:
             settings = validate_settings(overrides, base=settings)
         runtime = _meta_get(conn, "runtime") or _fresh_runtime()
-        ui_heartbeat_at = runtime.get("ui_heartbeat_at")
-        generation = int(runtime.get("generation") or 0) + 1
-        settings["armed"] = True
-        armed_at = _now()
-        baseline_ids: set[str] = set()
-        if settings.get("background_process_policy") == "wait_new":
-            cutoff = armed_at - int(settings.get("stale_heartbeat_seconds") or 20)
-            for row in conn.execute(
-                "SELECT process_details FROM heartbeats WHERE updated_at>=?",
-                (cutoff,),
-            ).fetchall():
-                try:
-                    heartbeat_details = json.loads(row["process_details"] or "[]")
-                except (TypeError, ValueError):
-                    heartbeat_details = []
-                for item in heartbeat_details:
-                    if isinstance(item, dict) and not _background_detail_key(item).split(":", 1)[0].startswith("sensor_"):
-                        baseline_ids.add(_background_detail_key(item))
-            _, _, local_details = _background_snapshot(
-                settings,
-                include_preexisting=True,
+        if str(runtime.get("arm_request_token") or "") != request_token:
+            arm_cancelled = True
+        else:
+            ui_heartbeat_at = runtime.get("ui_heartbeat_at")
+            generation = int(runtime.get("generation") or 0) + 1
+            if scope_session_ids:
+                placeholders = ",".join("?" for _ in scope_session_ids)
+                profile_clause = " AND profile=?" if current_profile else ""
+                params: list[Any] = [generation, request_started_at, *scope_session_ids]
+                if current_profile:
+                    params.append(current_profile)
+                conn.execute(
+                    "UPDATE tasks SET generation=? WHERE updated_at>=? OR "
+                    f"(session_id IN ({placeholders}){profile_clause} "
+                    "AND status IN ('running','waiting_input'))",
+                    params,
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET generation=? WHERE updated_at>=?",
+                    (generation, request_started_at),
+                )
+            activity_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE generation=?",
+                    (generation,),
+                ).fetchone()[0]
             )
-            for item in local_details:
-                if not _background_detail_key(item).split(":", 1)[0].startswith("sensor_"):
-                    baseline_ids.add(_background_detail_key(item))
-        runtime = _fresh_runtime()
-        runtime.update(
-            {
-                "generation": generation,
-                "state": "armed_waiting_for_task",
-                "armed_at": armed_at,
-                "armed_expires_at": armed_at + int(settings["arm_expiry_minutes"]) * 60,
-                "background_baseline_ids": sorted(baseline_ids),
-                "activity_seen": False,
-                "ui_heartbeat_at": ui_heartbeat_at,
-            }
-        )
-        _meta_set(conn, "settings", settings)
-        _meta_set(conn, "runtime", runtime)
-        _event(
-            conn,
-            "armed",
-            f"Armed generation {generation}",
-            {"action": settings["action"], "background_baseline_count": len(baseline_ids)},
-        )
+            settings["armed"] = True
+            runtime = _fresh_runtime()
+            runtime.update(
+                {
+                    "generation": generation,
+                    "state": "running" if activity_count else "armed_waiting_for_task",
+                    "armed_at": armed_at,
+                    "armed_expires_at": armed_at + int(settings["arm_expiry_minutes"]) * 60,
+                    "scope_mode": "current" if activity_count and current_session_id else "next",
+                    "scope_session_id": current_session_id if activity_count else "",
+                    "scope_session_ids": scope_session_ids if activity_count else [],
+                    "captured_task_count": activity_count,
+                    "background_baseline": baseline if settings.get("background_process_policy") == "wait_new" else {},
+                    "activity_seen": bool(activity_count),
+                    "ui_heartbeat_at": ui_heartbeat_at,
+                }
+            )
+            _meta_set(conn, "settings", settings)
+            _meta_set(conn, "runtime", runtime)
+            _event(
+                conn,
+                "armed",
+                f"Armed generation {generation}",
+                {
+                    "action": settings["action"],
+                    "background_baseline_count": len(baseline),
+                    "boundary_task_count": activity_count,
+                    "scope_mode": "current" if activity_count and current_session_id else "next",
+                    "scope_session_id": current_session_id if activity_count else "",
+                    "scope_session_ids": scope_session_ids if activity_count else [],
+                },
+            )
         conn.commit()
+    if arm_cancelled:
+        raise RuntimeError("Automatic sleep confirmation was cancelled by a newer action")
     start_monitor()
     return get_status()
 
@@ -574,6 +720,8 @@ def cancel(reason: str = "user_cancelled") -> Dict[str, Any]:
             {
                 "state": "disarmed",
                 "armed_expires_at": None,
+                "arm_request_token": "",
+                "arm_request_started_at": None,
                 "snooze_until": None,
                 "quiet_since": None,
                 "countdown_due": None,
@@ -1054,6 +1202,19 @@ def _background_detail_bucket(detail: Dict[str, Any]) -> str:
     return "process"
 
 
+def _process_started_at(row: Dict[str, Any], now: float) -> float:
+    raw = row.get("started_at")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            return float(time.mktime(time.strptime(raw, "%Y-%m-%dT%H:%M:%S")))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    uptime = max(0.0, float(row.get("uptime_seconds") or 0.0))
+    return now - uptime
+
+
 def _background_snapshot(
     settings: Dict[str, Any],
     *,
@@ -1098,14 +1259,13 @@ def _background_snapshot(
         for row in rows:
             if row.get("status") != "running":
                 continue
-            uptime = max(0.0, float(row.get("uptime_seconds") or 0.0))
             add(
                 {
                     "source": "process",
                     "id": row.get("session_id"),
                     "command": str(row.get("command") or "")[:160],
                     "detached": bool(row.get("detached")),
-                    "started_at": now - uptime,
+                    "started_at": _process_started_at(row, now),
                 }
             )
         pending_events = max(0, int(process_registry.completion_queue.qsize()))
@@ -1271,6 +1431,59 @@ def _eligible_terminal(outcome: str, settings: Dict[str, Any]) -> bool:
     return False
 
 
+def _scope_background_details(
+    settings: Dict[str, Any],
+    runtime: Dict[str, Any],
+    details: Iterable[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Apply the one-shot process baseline without weakening live work.
+
+    Only long-lived terminal processes are baselined. Cron runs, subagents,
+    and completion deliveries always block because a stable job/queue identity
+    cannot prove that a later occurrence is the same pre-arm work.
+    """
+    items = [dict(item) for item in details if isinstance(item, dict)]
+    if settings.get("background_process_policy") != "wait_new":
+        return items
+    raw_baseline = runtime.get("background_baseline") or {}
+    baseline = {
+        str(key): max(0, int(value or 0))
+        for key, value in raw_baseline.items()
+    } if isinstance(raw_baseline, dict) else {
+        str(key): 1 for key in (runtime.get("background_baseline_ids") or [])
+    }
+    armed_at = runtime.get("armed_at")
+    scoped: list[Dict[str, Any]] = []
+    for item in items:
+        key = _background_detail_key(item)
+        source = key.split(":", 1)[0]
+        if source != "process":
+            scoped.append(item)
+            continue
+        units = max(1, int(item.get("units") or 1))
+        if key not in baseline:
+            # A timestamp alone is not proof of pre-arm observation (the
+            # registry exposes second-level start times). Unknown identities
+            # therefore block even when their coarse timestamp predates arm.
+            scoped.append(item)
+            continue
+        started_at = item.get("started_at")
+        if armed_at is not None and started_at is not None:
+            try:
+                if float(started_at) > float(armed_at):
+                    scoped.append(item)
+                    continue
+                remaining = max(0, units - baseline[key])
+            except (TypeError, ValueError):
+                remaining = max(0, units - baseline[key])
+        else:
+            remaining = max(0, units - baseline[key])
+        if remaining:
+            item["units"] = remaining
+            scoped.append(item)
+    return scoped
+
+
 def _aggregate_background_heartbeats(
     conn: sqlite3.Connection,
     settings: Dict[str, Any],
@@ -1324,34 +1537,9 @@ def _aggregate_background_heartbeats(
             if existing is None or int(item.get("units") or 1) > int(existing.get("units") or 1):
                 details_by_key[key] = dict(item)
 
-    background_details = list(details_by_key.values())
-    if settings.get("background_process_policy") == "wait_new":
-        baseline = {str(item) for item in runtime.get("background_baseline_ids") or []}
-        observed_keys = {
-            _background_detail_key(item)
-            for item in background_details
-            if not _background_detail_key(item).split(":", 1)[0].startswith("sensor_")
-        }
-        baseline.intersection_update(observed_keys)
-        runtime["background_baseline_ids"] = sorted(baseline)
-        armed_at = runtime.get("armed_at")
-        scoped_details: list[Dict[str, Any]] = []
-        for item in background_details:
-            source = _background_detail_key(item).split(":", 1)[0]
-            if source.startswith("sensor_"):
-                scoped_details.append(item)
-                continue
-            if _background_detail_key(item) in baseline:
-                continue
-            started_at = item.get("started_at")
-            if armed_at is not None and started_at is not None:
-                try:
-                    if float(started_at) <= float(armed_at):
-                        continue
-                except (TypeError, ValueError):
-                    pass
-            scoped_details.append(item)
-        background_details = scoped_details
+    background_details = _scope_background_details(
+        settings, runtime, details_by_key.values()
+    )
 
     detail_processes = sum(
         max(1, int(item.get("units") or 1))
@@ -1374,6 +1562,12 @@ def _aggregate_background_heartbeats(
 
 def _evaluate() -> Optional[Dict[str, Any]]:
     """Advance the shared state machine. Returns an action claim if due."""
+    settings_probe = get_settings()
+    protected_names_probe = tuple(settings_probe.get("protected_processes") or [])
+    if settings_probe.get("armed") and protected_names_probe:
+        protected_probe, process_scan_probe_ok = _protected_processes_running(protected_names_probe)
+    else:
+        protected_probe, process_scan_probe_ok = [], True
     now = _now()
     claim: Optional[Dict[str, Any]] = None
     with _connect() as conn:
@@ -1559,7 +1753,12 @@ def _evaluate() -> Optional[Dict[str, Any]]:
             conn.commit()
             return None
 
-        protected, process_scan_ok = _protected_processes_running(settings.get("protected_processes") or [])
+        if tuple(settings.get("protected_processes") or []) == protected_names_probe:
+            protected, process_scan_ok = protected_probe, process_scan_probe_ok
+        else:
+            # Policy changed after the out-of-transaction sample. Retry on the
+            # next monitor tick rather than scanning under the write lock.
+            protected, process_scan_ok = [], False
         runtime["protected_processes_running"] = protected
         runtime["protected_process_scan_ok"] = process_scan_ok
         if protected or not process_scan_ok:
@@ -1700,6 +1899,10 @@ def _claim_still_safe(claim: Dict[str, Any]) -> bool:
     protected, process_scan_ok = _protected_processes_running(
         settings_snapshot.get("protected_processes") or []
     )
+    _, _, live_background_details = _background_snapshot(
+        settings_snapshot,
+        include_preexisting=True,
+    )
     now = _now()
 
     with _connect() as conn:
@@ -1737,6 +1940,11 @@ def _claim_still_safe(claim: Dict[str, Any]) -> bool:
         )
         if background_processes or delegations:
             reasons.append("background work became active")
+        scoped_live_details = _scope_background_details(
+            settings, runtime, live_background_details
+        )
+        if scoped_live_details:
+            reasons.append("live background resample found active work")
         if int(runtime.get("desktop_busy_count") or 0):
             reasons.append("another Desktop session is busy")
 
@@ -1771,13 +1979,89 @@ def _claim_still_safe(claim: Dict[str, Any]) -> bool:
 
 def _claim_token_is_current(claim: Dict[str, Any]) -> bool:
     """Last micro-check immediately adjacent to the irreversible OS call."""
+    simulate = bool(claim.get("simulate"))
+    settings_probe = get_settings()
+    protected_names_probe = tuple(settings_probe.get("protected_processes") or [])
+    if simulate:
+        live_details: list[Dict[str, Any]] = []
+        protected_probe, protected_probe_ok = [], True
+        idle_probe: Optional[float] = None
+    else:
+        _, _, live_details = _background_snapshot(
+            settings_probe,
+            include_preexisting=True,
+        )
+        protected_probe, protected_probe_ok = _protected_processes_running(
+            protected_names_probe
+        )
+        idle_probe = _user_idle_seconds()
+    sampled_at = _now()
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        settings = validate_settings(_meta_get(conn, "settings") or {})
         runtime = _meta_get(conn, "runtime") or _fresh_runtime()
-        return bool(
+        reasons: list[str] = []
+        current = bool(
             str(runtime.get("countdown_token") or "") == str(claim.get("token") or "")
             and runtime.get("state") == "executing"
             and runtime.get("action_claimed_by") == PROCESS_INSTANCE
         )
+        if not current:
+            reasons.append("claim token or owner changed")
+        if settings.get("action") != claim.get("action"):
+            reasons.append("action setting changed after final safety check")
+        expected_simulate = bool(
+            claim.get("test_only")
+            or settings.get("dry_run")
+            or os.getenv("POWER_GUARD_TEST_MODE") == "1"
+        )
+        if simulate != expected_simulate:
+            reasons.append("simulation policy changed after final safety check")
+        if not simulate:
+            heartbeat_at = runtime.get("ui_heartbeat_at")
+            if heartbeat_at is None or sampled_at - float(heartbeat_at) > UI_HEARTBEAT_TIMEOUT_SECONDS:
+                reasons.append("Desktop UI heartbeat expired after final safety check")
+            if int(runtime.get("desktop_busy_count") or 0):
+                reasons.append("another Desktop session became busy")
+            generation = int(runtime.get("generation") or 0)
+            active_tasks = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE generation=? "
+                    "AND status IN ('running','waiting_input')",
+                    (generation,),
+                ).fetchone()[0]
+            )
+            if active_tasks:
+                reasons.append("task became active after final safety check")
+            if _scope_background_details(settings, runtime, live_details):
+                reasons.append("background work appeared after final safety check")
+            if tuple(settings.get("protected_processes") or []) != protected_names_probe:
+                reasons.append("protected-process policy changed")
+            elif protected_probe or not protected_probe_ok:
+                reasons.append("protected process appeared after final safety check")
+            baseline_input_at = runtime.get("countdown_last_input_at")
+            if idle_probe is None:
+                reasons.append("user-input sensor unavailable after final safety check")
+            elif baseline_input_at is not None and sampled_at - float(idle_probe) > float(baseline_input_at) + 1.0:
+                reasons.append("keyboard or mouse input occurred after final safety check")
+            if settings.get("require_user_idle") and (
+                idle_probe is None or idle_probe < int(settings["user_idle_seconds"])
+            ):
+                reasons.append("user became active after final safety check")
+        if reasons:
+            if current:
+                runtime["state"] = "disarmed"
+                runtime["countdown_due"] = None
+                runtime["countdown_reason"] = ""
+                runtime["countdown_token"] = ""
+                runtime["action_claimed_by"] = ""
+                runtime["updated_at"] = _now()
+                _meta_set(conn, "runtime", runtime)
+                _event(conn, "action_aborted", "; ".join(reasons))
+            conn.commit()
+            return False
+        conn.commit()
+        return True
 
 
 def _execute_power_action(action: str, simulate: bool) -> tuple[bool, str]:
@@ -1965,13 +2249,18 @@ def _manage_global_power_plan(settings: Dict[str, Any], working: bool) -> None:
 
 def _manage_global_power_plan_locked(settings: Dict[str, Any], working: bool) -> None:
     desired = str(settings.get("power_plan") or "unchanged")
+    with _connect() as probe_conn:
+        runtime_probe = _meta_get(probe_conn, "runtime") or _fresh_runtime()
+    needs_apply_probe = bool(
+        working and desired != "unchanged" and not runtime_probe.get("power_plan_applied")
+    )
+    previous_probe = _current_power_plan() if needs_apply_probe else ""
     action: Optional[tuple[str, str, str]] = None
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         runtime = _meta_get(conn, "runtime") or _fresh_runtime()
         if working and desired != "unchanged" and not runtime.get("power_plan_applied"):
-            previous = _current_power_plan()
-            runtime["power_plan_previous"] = previous
+            runtime["power_plan_previous"] = previous_probe
             runtime["power_plan_applied"] = "pending"
             _meta_set(conn, "runtime", runtime)
             action = ("apply", desired, "")
@@ -2159,19 +2448,20 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
 
     armed_gate = "pass" if settings.get("armed") else "blocked" if state == "expired" else "wait"
     activity_gate = "pass" if runtime.get("activity_seen") else "wait"
+    scope_current = runtime.get("scope_mode") == "current"
     work_gate = "pass" if runtime.get("activity_seen") and active_total == 0 else "active" if active_total else "wait"
     gates = [
         {
             "id": "armed",
             "label": "本次自动睡眠已启用" if armed_gate == "pass" else "本次自动睡眠已失效" if armed_gate == "blocked" else "本次自动睡眠未启用",
             "status": armed_gate,
-            "detail": "仅跟踪启用后开始的任务" if armed_gate == "pass" else "不会执行电源动作",
+            "detail": "已接管当前项目" if armed_gate == "pass" and scope_current else "等待下一个项目" if armed_gate == "pass" else "不会执行电源动作",
         },
         {
             "id": "activity",
-            "label": "新任务已开始" if activity_gate == "pass" else "等待启用后的第一个任务",
+            "label": "当前项目已接管" if activity_gate == "pass" and scope_current else "新任务已开始" if activity_gate == "pass" else "等待第一个任务",
             "status": activity_gate,
-            "detail": "已记录本次任务" if activity_gate == "pass" else "已有任务不会被倒追",
+            "detail": f"已纳入 {runtime.get('captured_task_count') or 0} 个运行中任务" if activity_gate == "pass" and scope_current else "已记录本次任务" if activity_gate == "pass" else "当前没有运行中任务",
         },
         {
             "id": "work",
@@ -2222,7 +2512,7 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
 
     summaries = {
         "disarmed": (f"自动{action_name}未启用", "当前不会执行任何电源动作。"),
-        "armed_waiting_for_task": ("等待启用后的第一个任务", f"已有任务不会被倒追，也不会单独触发{action_name}。"),
+        "armed_waiting_for_task": ("等待下一个 Hermes 任务", f"启用时没有检测到当前运行中的任务；下一个任务结束后自动{action_name}。"),
         "running": (f"Hermes 还有 {active_total} 项工作", running_detail),
         "waiting_for_desktop_ui": ("控制面板已离线", "无法显示或取消倒计时，因此电脑保持唤醒。"),
         "waiting_for_terminal_signal": ("任务结束信号不完整", "没有可确认的完成或阻塞结果，因此电脑保持唤醒。"),
@@ -2243,7 +2533,7 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
     }
     next_steps = {
         "disarmed": f"保存规则后，启用本次自动{action_name}。",
-        "armed_waiting_for_task": "开始一个新的 Hermes 任务。",
+        "armed_waiting_for_task": "无需操作；开始下一个任务后自动跟踪。",
         "running": "无需操作；所有工作结束后自动继续。",
         "waiting_for_desktop_ui": "重新打开 Power Guard 页面或恢复 Desktop 连接。",
         "waiting_for_terminal_signal": "保持唤醒，等待 Hermes 给出明确结果。",

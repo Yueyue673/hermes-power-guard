@@ -36,9 +36,9 @@ Completion cohort:
 
 - work in the active Hermes profile observed after explicit confirmation;
 - supported Kanban lifecycle events observed by the plugin;
-- background processes, subagents, completion deliveries, and cron runs that start after confirmation.
+- terminal background processes that start after confirmation.
 
-Pre-existing background work is recorded as the campaign baseline by default. The strict `wait_all` policy is available when every already-running Hermes process should remain a veto.
+Long-running terminal processes observed before confirmation are the campaign baseline under `wait_new`. Subagents, completion deliveries, and cron runs always remain blockers. The strict `wait_all` policy is available when every already-running terminal process should remain a veto.
 
 Safety blockers:
 
