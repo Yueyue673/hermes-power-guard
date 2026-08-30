@@ -4,9 +4,9 @@
 
 **Put Windows to sleep after Hermes has no observable work left—not after an assistant merely says it is done.**
 
-Each use requires one confirmation. Power Guard watches the work that starts afterward, explains what is still keeping the PC awake, and shows a countdown you can cancel before it asks Windows to sleep.
+Each use requires one confirmation. If the focused Desktop project is already running, Power Guard captures it immediately; otherwise it waits for the next task. It explains what is still keeping the PC awake and shows a countdown you can cancel before it asks Windows to sleep.
 
-[Download v0.4.0](https://github.com/Yueyue673/hermes-power-guard/releases/latest) · [Install](#install) · [How it decides](#how-it-decides) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [中文](README.zh-CN.md)
+[Download latest](https://github.com/Yueyue673/hermes-power-guard/releases/latest) · [Install](#install) · [How it decides](#how-it-decides) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [中文](README.zh-CN.md)
 
 ![Power Guard overview while one session and one subagent are still active](assets/ui-preview.svg)
 
@@ -63,7 +63,7 @@ Open **Power Guard** from the Desktop sidebar.
 - **Energy** controls power use while Hermes is still working.
 - **History** shows task results and state changes.
 
-Save the rule, then select **Enable this automatic sleep**. It will not act on work that started before confirmation.
+Save the rule, then select **Enable this automatic sleep**. A running focused session—and every busy Desktop session if the page has lost chat focus—is captured into this one-shot campaign. Unrelated old daemons remain baseline work.
 
 Inspection and simulation commands:
 

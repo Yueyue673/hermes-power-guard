@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Safety hardening
 
+- Capture the already-running focused Desktop project when arming; if route navigation clears chat focus, recover every currently busy Desktop session instead of silently waiting for a new project.
 - Define the arm boundary after all pre-arm registry sampling and keep external sensor calls outside SQLite write transactions.
 - Baseline only long-running terminal processes; cron runs, subagents, and completion deliveries always remain blockers.
 - Track baseline units and process start times so work appearing after the arm boundary cannot be hidden by a stable identity.
