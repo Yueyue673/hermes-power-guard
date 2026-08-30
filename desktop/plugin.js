@@ -520,7 +520,18 @@ function PowerGuardPage() {
   const focusedSessionId = useValue(host.state.focusedSessionId)
   const focusedSessionProfile = useValue(host.state.focusedSessionProfile)
   const busyBySession = useValue(host.state.busyBySession)
-  const currentSessionBusy = Boolean(focusedSessionId && busyBySession?.[focusedSessionId])
+  const rememberedScope = pluginContext?.storage.get('last-focused-session', { id: '', profile: '' }) || { id: '', profile: '' }
+  const busySessionIds = Object.entries(busyBySession || {}).filter(([, busy]) => Boolean(busy)).map(([id]) => id)
+  const preferredSessionId = focusedSessionId && busyBySession?.[focusedSessionId]
+    ? focusedSessionId
+    : rememberedScope.id && busyBySession?.[rememberedScope.id]
+      ? rememberedScope.id
+      : ''
+  const scopeSessionIds = [...new Set([preferredSessionId, ...busySessionIds].filter(Boolean))]
+  const currentSessionBusy = scopeSessionIds.length > 0
+  const scopeProfile = scopeSessionIds.length === 1
+    ? (scopeSessionIds[0] === focusedSessionId ? focusedSessionProfile : rememberedScope.profile || '')
+    : ''
   const statusQuery = useQuery({ queryFn: () => request('/status'), queryKey: QUERY_KEY, refetchInterval: 2000 })
   const [view, setView] = useState('overview')
   const [draft, setDraft] = useState(null)
@@ -546,7 +557,7 @@ function PowerGuardPage() {
     onError: error => host.notifyError(error, 'Power Guard 规则保存失败')
   })
   const armMutation = useMutation({
-    mutationFn: () => request('/arm', { method: 'POST', body: { current_session_id: focusedSessionId || '', current_profile: focusedSessionProfile || '' } }),
+    mutationFn: () => request('/arm', { method: 'POST', body: { current_session_id: scopeSessionIds[0] || '', current_session_ids: scopeSessionIds, current_profile: scopeProfile } }),
     onSuccess: data => {
       refreshSettings(data)
       const captured = Number(data.runtime?.captured_task_count || 0)
@@ -628,9 +639,14 @@ function PowerGuardPage() {
 function PowerGuardStatus() {
   const queryClient = useQueryClient()
   const notifiedToken = useRef('')
+  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const focusedSessionProfile = useValue(host.state.focusedSessionProfile)
   const busyBySession = useValue(host.state.busyBySession)
   const busyCountRef = useRef(0)
   busyCountRef.current = Object.values(busyBySession || {}).filter(Boolean).length
+  useEffect(() => {
+    if (focusedSessionId) pluginContext?.storage.set('last-focused-session', { id: focusedSessionId, profile: focusedSessionProfile || '' })
+  }, [focusedSessionId, focusedSessionProfile])
   useQuery({
     queryFn: () => request('/ui-heartbeat', { method: 'POST', body: { busy_count: busyCountRef.current, instance_id: UI_INSTANCE_ID } }),
     queryKey: ['power-guard', 'ui-heartbeat'], refetchInterval: 2000, retry: false

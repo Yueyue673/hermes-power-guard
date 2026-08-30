@@ -180,6 +180,25 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(armed["runtime"]["scope_mode"], "next")
         self.assertEqual(armed["runtime"]["captured_task_count"], 0)
 
+    def test_arm_captures_all_desktop_busy_sessions_when_page_has_no_focus_id(self):
+        for suffix in ("one", "two"):
+            core.record_turn_start(
+                session_id=f"busy-{suffix}",
+                task_id=f"task-{suffix}",
+                turn_id=f"turn-{suffix}",
+                platform_name="desktop",
+                profile="default",
+            )
+        core.record_ui_heartbeat(busy_count=2)
+        armed = core.arm(
+            {"require_user_idle": False},
+            current_session_ids=["busy-one", "busy-two"],
+            current_profile="default",
+        )
+        self.assertEqual(armed["runtime"]["scope_mode"], "current")
+        self.assertEqual(armed["runtime"]["captured_task_count"], 2)
+        self.assertEqual(armed["runtime"]["scope_session_ids"], ["busy-one", "busy-two"])
+
     def test_current_project_process_is_not_hidden_in_old_daemon_baseline(self):
         core.record_turn_start(
             session_id="current-session",

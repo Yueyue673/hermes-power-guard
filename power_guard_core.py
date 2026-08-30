@@ -332,6 +332,7 @@ def _fresh_runtime() -> Dict[str, Any]:
         "arm_request_started_at": None,
         "scope_mode": "next",
         "scope_session_id": "",
+        "scope_session_ids": [],
         "captured_task_count": 0,
         "background_baseline": {},
         "activity_seen": False,
@@ -557,11 +558,18 @@ def arm(
     overrides: Optional[Dict[str, Any]] = None,
     *,
     current_session_id: str = "",
+    current_session_ids: Optional[list[str]] = None,
     current_profile: str = "",
 ) -> Dict[str, Any]:
     request_token = uuid.uuid4().hex
     request_started_at = _now()
     current_session_id = str(current_session_id or "")[:240]
+    scope_session_ids = []
+    for value in [current_session_id, *(current_session_ids or [])]:
+        normalized = str(value or "")[:240]
+        if normalized and normalized not in scope_session_ids:
+            scope_session_ids.append(normalized)
+    current_session_id = scope_session_ids[0] if scope_session_ids else ""
     current_profile = str(current_profile or "")[:120]
     arm_cancelled = False
     with _connect() as conn:
@@ -601,7 +609,11 @@ def arm(
             include_preexisting=True,
         )
         observed_details.extend(local_details)
-    scope_task_ids = _active_scope_task_ids(current_session_id, current_profile)
+    scope_task_ids = sorted({
+        task_id
+        for session_id in scope_session_ids
+        for task_id in _active_scope_task_ids(session_id, current_profile)
+    })
     scope_process_keys = _scope_process_keys(scope_task_ids)
     armed_at = _now()
     baseline: Dict[str, int] = {}
@@ -633,17 +645,17 @@ def arm(
         else:
             ui_heartbeat_at = runtime.get("ui_heartbeat_at")
             generation = int(runtime.get("generation") or 0) + 1
-            if current_session_id and current_profile:
+            if scope_session_ids:
+                placeholders = ",".join("?" for _ in scope_session_ids)
+                profile_clause = " AND profile=?" if current_profile else ""
+                params: list[Any] = [generation, request_started_at, *scope_session_ids]
+                if current_profile:
+                    params.append(current_profile)
                 conn.execute(
                     "UPDATE tasks SET generation=? WHERE updated_at>=? OR "
-                    "(session_id=? AND profile=? AND status IN ('running','waiting_input'))",
-                    (generation, request_started_at, current_session_id, current_profile),
-                )
-            elif current_session_id:
-                conn.execute(
-                    "UPDATE tasks SET generation=? WHERE updated_at>=? OR "
-                    "(session_id=? AND status IN ('running','waiting_input'))",
-                    (generation, request_started_at, current_session_id),
+                    f"(session_id IN ({placeholders}){profile_clause} "
+                    "AND status IN ('running','waiting_input'))",
+                    params,
                 )
             else:
                 conn.execute(
@@ -666,6 +678,7 @@ def arm(
                     "armed_expires_at": armed_at + int(settings["arm_expiry_minutes"]) * 60,
                     "scope_mode": "current" if activity_count and current_session_id else "next",
                     "scope_session_id": current_session_id if activity_count else "",
+                    "scope_session_ids": scope_session_ids if activity_count else [],
                     "captured_task_count": activity_count,
                     "background_baseline": baseline if settings.get("background_process_policy") == "wait_new" else {},
                     "activity_seen": bool(activity_count),
@@ -684,6 +697,7 @@ def arm(
                     "boundary_task_count": activity_count,
                     "scope_mode": "current" if activity_count and current_session_id else "next",
                     "scope_session_id": current_session_id if activity_count else "",
+                    "scope_session_ids": scope_session_ids if activity_count else [],
                 },
             )
         conn.commit()
