@@ -330,6 +330,9 @@ def _fresh_runtime() -> Dict[str, Any]:
         "armed_expires_at": None,
         "arm_request_token": "",
         "arm_request_started_at": None,
+        "scope_mode": "next",
+        "scope_session_id": "",
+        "captured_task_count": 0,
         "background_baseline": {},
         "activity_seen": False,
         "snooze_until": None,
@@ -514,9 +517,52 @@ def _task_key(session_id: str, task_id: str, turn_id: str, profile: str = "") ->
     return f"turn:{digest}:{identity}"
 
 
-def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _active_scope_task_ids(session_id: str, profile: str = "") -> list[str]:
+    if not session_id:
+        return []
+    with _connect() as conn:
+        if profile:
+            rows = conn.execute(
+                "SELECT DISTINCT task_id FROM tasks WHERE session_id=? AND profile=? "
+                "AND status IN ('running','waiting_input') AND task_id<>''",
+                (session_id, profile),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT task_id FROM tasks WHERE session_id=? "
+                "AND status IN ('running','waiting_input') AND task_id<>''",
+                (session_id,),
+            ).fetchall()
+    return [str(row[0]) for row in rows if row[0]]
+
+
+def _scope_process_keys(task_ids: list[str]) -> set[str]:
+    if not task_ids:
+        return set()
+    try:
+        from tools.process_registry import process_registry
+
+        keys: set[str] = set()
+        for task_id in task_ids:
+            for row in process_registry.list_sessions(task_id=task_id):
+                if row.get("status") == "running" and row.get("session_id"):
+                    keys.add(f"process:{row['session_id']}")
+        return keys
+    except Exception:
+        logger.exception("Power Guard could not identify current-project processes")
+        return set()
+
+
+def arm(
+    overrides: Optional[Dict[str, Any]] = None,
+    *,
+    current_session_id: str = "",
+    current_profile: str = "",
+) -> Dict[str, Any]:
     request_token = uuid.uuid4().hex
     request_started_at = _now()
+    current_session_id = str(current_session_id or "")[:240]
+    current_profile = str(current_profile or "")[:120]
     arm_cancelled = False
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -555,6 +601,8 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             include_preexisting=True,
         )
         observed_details.extend(local_details)
+    scope_task_ids = _active_scope_task_ids(current_session_id, current_profile)
+    scope_process_keys = _scope_process_keys(scope_task_ids)
     armed_at = _now()
     baseline: Dict[str, int] = {}
     for item in observed_details:
@@ -568,6 +616,10 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 pass
         key = _background_detail_key(item)
+        if key in scope_process_keys:
+            # Existing terminals launched by the current project belong to the
+            # captured cohort; unlike unrelated old daemons, they must finish.
+            continue
         baseline[key] = max(baseline.get(key, 0), max(1, int(item.get("units") or 1)))
 
     with _connect() as conn:
@@ -581,10 +633,23 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         else:
             ui_heartbeat_at = runtime.get("ui_heartbeat_at")
             generation = int(runtime.get("generation") or 0) + 1
-            conn.execute(
-                "UPDATE tasks SET generation=? WHERE updated_at>=?",
-                (generation, request_started_at),
-            )
+            if current_session_id and current_profile:
+                conn.execute(
+                    "UPDATE tasks SET generation=? WHERE updated_at>=? OR "
+                    "(session_id=? AND profile=? AND status IN ('running','waiting_input'))",
+                    (generation, request_started_at, current_session_id, current_profile),
+                )
+            elif current_session_id:
+                conn.execute(
+                    "UPDATE tasks SET generation=? WHERE updated_at>=? OR "
+                    "(session_id=? AND status IN ('running','waiting_input'))",
+                    (generation, request_started_at, current_session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET generation=? WHERE updated_at>=?",
+                    (generation, request_started_at),
+                )
             activity_count = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM tasks WHERE generation=?",
@@ -599,6 +664,9 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                     "state": "running" if activity_count else "armed_waiting_for_task",
                     "armed_at": armed_at,
                     "armed_expires_at": armed_at + int(settings["arm_expiry_minutes"]) * 60,
+                    "scope_mode": "current" if activity_count and current_session_id else "next",
+                    "scope_session_id": current_session_id if activity_count else "",
+                    "captured_task_count": activity_count,
                     "background_baseline": baseline if settings.get("background_process_policy") == "wait_new" else {},
                     "activity_seen": bool(activity_count),
                     "ui_heartbeat_at": ui_heartbeat_at,
@@ -614,6 +682,8 @@ def arm(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                     "action": settings["action"],
                     "background_baseline_count": len(baseline),
                     "boundary_task_count": activity_count,
+                    "scope_mode": "current" if activity_count and current_session_id else "next",
+                    "scope_session_id": current_session_id if activity_count else "",
                 },
             )
         conn.commit()
@@ -2364,19 +2434,20 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
 
     armed_gate = "pass" if settings.get("armed") else "blocked" if state == "expired" else "wait"
     activity_gate = "pass" if runtime.get("activity_seen") else "wait"
+    scope_current = runtime.get("scope_mode") == "current"
     work_gate = "pass" if runtime.get("activity_seen") and active_total == 0 else "active" if active_total else "wait"
     gates = [
         {
             "id": "armed",
             "label": "本次自动睡眠已启用" if armed_gate == "pass" else "本次自动睡眠已失效" if armed_gate == "blocked" else "本次自动睡眠未启用",
             "status": armed_gate,
-            "detail": "仅跟踪启用后开始的任务" if armed_gate == "pass" else "不会执行电源动作",
+            "detail": "已接管当前项目" if armed_gate == "pass" and scope_current else "等待下一个项目" if armed_gate == "pass" else "不会执行电源动作",
         },
         {
             "id": "activity",
-            "label": "新任务已开始" if activity_gate == "pass" else "等待启用后的第一个任务",
+            "label": "当前项目已接管" if activity_gate == "pass" and scope_current else "新任务已开始" if activity_gate == "pass" else "等待第一个任务",
             "status": activity_gate,
-            "detail": "已记录本次任务" if activity_gate == "pass" else "已有任务不会被倒追",
+            "detail": f"已纳入 {runtime.get('captured_task_count') or 0} 个运行中任务" if activity_gate == "pass" and scope_current else "已记录本次任务" if activity_gate == "pass" else "当前没有运行中任务",
         },
         {
             "id": "work",
@@ -2427,7 +2498,7 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
 
     summaries = {
         "disarmed": (f"自动{action_name}未启用", "当前不会执行任何电源动作。"),
-        "armed_waiting_for_task": ("等待启用后的第一个任务", f"已有任务不会被倒追，也不会单独触发{action_name}。"),
+        "armed_waiting_for_task": ("等待下一个 Hermes 任务", f"启用时没有检测到当前运行中的任务；下一个任务结束后自动{action_name}。"),
         "running": (f"Hermes 还有 {active_total} 项工作", running_detail),
         "waiting_for_desktop_ui": ("控制面板已离线", "无法显示或取消倒计时，因此电脑保持唤醒。"),
         "waiting_for_terminal_signal": ("任务结束信号不完整", "没有可确认的完成或阻塞结果，因此电脑保持唤醒。"),
@@ -2448,7 +2519,7 @@ def _decision_snapshot(settings: Dict[str, Any], runtime: Dict[str, Any], tasks:
     }
     next_steps = {
         "disarmed": f"保存规则后，启用本次自动{action_name}。",
-        "armed_waiting_for_task": "开始一个新的 Hermes 任务。",
+        "armed_waiting_for_task": "无需操作；开始下一个任务后自动跟踪。",
         "running": "无需操作；所有工作结束后自动继续。",
         "waiting_for_desktop_ui": "重新打开 Power Guard 页面或恢复 Desktop 连接。",
         "waiting_for_terminal_signal": "保持唤醒，等待 Hermes 给出明确结果。",

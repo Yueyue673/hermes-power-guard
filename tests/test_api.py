@@ -64,6 +64,22 @@ class PowerGuardApiTests(unittest.TestCase):
         self.assertTrue(test["runtime"]["test_only"])
         self.assertEqual(test["runtime"]["state"], "countdown")
 
+    def test_arm_route_captures_current_session(self):
+        core.record_turn_start(
+            session_id="desktop-session",
+            task_id="desktop-task",
+            turn_id="desktop-turn",
+            platform_name="desktop",
+            profile="default",
+        )
+        armed = self.run_async(self.api.arm({
+            "require_user_idle": False,
+            "current_session_id": "desktop-session",
+            "current_profile": "default",
+        }))
+        self.assertEqual(armed["runtime"]["scope_mode"], "current")
+        self.assertEqual(armed["runtime"]["captured_task_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

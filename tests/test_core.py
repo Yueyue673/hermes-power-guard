@@ -119,6 +119,95 @@ class PowerGuardCoreTests(unittest.TestCase):
         self.assertEqual(status["runtime"]["state"], "armed_waiting_for_task")
         self.assertFalse(status["runtime"]["activity_seen"])
 
+    def test_arm_captures_current_running_session(self):
+        core.record_turn_start(
+            session_id="current-session",
+            task_id="current-task",
+            turn_id="current-turn",
+            platform_name="desktop",
+            profile="default",
+        )
+        core.record_ui_heartbeat()
+        armed = core.arm(
+            {"require_user_idle": False},
+            current_session_id="current-session",
+            current_profile="default",
+        )
+        self.assertEqual(armed["runtime"]["state"], "running")
+        self.assertTrue(armed["runtime"]["activity_seen"])
+        self.assertEqual(armed["runtime"]["scope_mode"], "current")
+        self.assertEqual(armed["runtime"]["scope_session_id"], "current-session")
+        self.assertEqual(armed["runtime"]["captured_task_count"], 1)
+        with core._connect() as conn:
+            row = conn.execute(
+                "SELECT generation FROM tasks WHERE session_id='current-session'"
+            ).fetchone()
+        self.assertEqual(int(row[0]), armed["runtime"]["generation"])
+        core.record_response(
+            session_id="current-session",
+            task_id="current-task",
+            turn_id="current-turn",
+            profile="default",
+            response="done",
+        )
+        core.finish_turn(
+            session_id="current-session",
+            task_id="current-task",
+            turn_id="current-turn",
+            profile="default",
+            completed=True,
+            turn_exit_reason="text_response(stop)",
+        )
+        core._evaluate()
+        self.assertEqual(core.get_status()["runtime"]["state"], "quiescence")
+
+    def test_arm_does_not_capture_other_running_session(self):
+        core.record_turn_start(
+            session_id="other-session",
+            task_id="other-task",
+            turn_id="other-turn",
+            platform_name="desktop",
+            profile="default",
+        )
+        core.record_ui_heartbeat()
+        armed = core.arm(
+            {"require_user_idle": False},
+            current_session_id="current-session",
+            current_profile="default",
+        )
+        self.assertEqual(armed["runtime"]["state"], "armed_waiting_for_task")
+        self.assertFalse(armed["runtime"]["activity_seen"])
+        self.assertEqual(armed["runtime"]["scope_mode"], "next")
+        self.assertEqual(armed["runtime"]["captured_task_count"], 0)
+
+    def test_current_project_process_is_not_hidden_in_old_daemon_baseline(self):
+        core.record_turn_start(
+            session_id="current-session",
+            task_id="current-task",
+            turn_id="current-turn",
+            platform_name="desktop",
+            profile="default",
+        )
+        core.record_ui_heartbeat()
+        detail = {
+            "source": "process",
+            "id": "project-worker",
+            "command": "project worker",
+            "started_at": time.time() - 300,
+            "units": 1,
+        }
+        with mock.patch.object(
+            core, "_background_snapshot", return_value=(1, 0, [detail])
+        ), mock.patch.object(
+            core, "_scope_process_keys", return_value={"process:project-worker"}
+        ):
+            armed = core.arm(
+                {"require_user_idle": False},
+                current_session_id="current-session",
+                current_profile="default",
+            )
+        self.assertNotIn("process:project-worker", armed["runtime"]["background_baseline"])
+
     def test_missing_desktop_ui_heartbeat_blocks_terminal_campaign(self):
         core.arm({"require_user_idle": False, "quiescence_seconds": 0})
         self.terminal_task()
@@ -211,8 +300,8 @@ class PowerGuardCoreTests(unittest.TestCase):
         status = self.arm_ready({"require_user_idle": False})
         self.assertEqual(status["capabilities"]["ui_contract_version"], 2)
         self.assertEqual(status["decision"]["state"], "armed_waiting_for_task")
-        self.assertEqual(status["decision"]["summary"], "等待启用后的第一个任务")
-        self.assertEqual(status["decision"]["next"], "开始一个新的 Hermes 任务。")
+        self.assertEqual(status["decision"]["summary"], "等待下一个 Hermes 任务")
+        self.assertEqual(status["decision"]["next"], "无需操作；开始下一个任务后自动跟踪。")
         self.assertEqual(len(status["decision"]["gates"]), 7)
         visible_copy = json.dumps(status["decision"], ensure_ascii=False)
         self.assertNotIn("武装", visible_copy)
