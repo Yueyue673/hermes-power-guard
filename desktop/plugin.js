@@ -517,10 +517,10 @@ function OfflineBanner({ onRetry }) {
 
 function PowerGuardPage() {
   const queryClient = useQueryClient()
-  const activeSessionId = useValue(host.state.activeSessionId)
-  const activeProfile = useValue(host.state.profile)
+  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const focusedSessionProfile = useValue(host.state.focusedSessionProfile)
   const busyBySession = useValue(host.state.busyBySession)
-  const currentSessionBusy = Boolean(activeSessionId && busyBySession?.[activeSessionId])
+  const currentSessionBusy = Boolean(focusedSessionId && busyBySession?.[focusedSessionId])
   const statusQuery = useQuery({ queryFn: () => request('/status'), queryKey: QUERY_KEY, refetchInterval: 2000 })
   const [view, setView] = useState('overview')
   const [draft, setDraft] = useState(null)
@@ -546,7 +546,7 @@ function PowerGuardPage() {
     onError: error => host.notifyError(error, 'Power Guard 规则保存失败')
   })
   const armMutation = useMutation({
-    mutationFn: () => request('/arm', { method: 'POST', body: { current_session_id: activeSessionId || '', current_profile: activeProfile || '' } }),
+    mutationFn: () => request('/arm', { method: 'POST', body: { current_session_id: focusedSessionId || '', current_profile: focusedSessionProfile || '' } }),
     onSuccess: data => {
       refreshSettings(data)
       const captured = Number(data.runtime?.captured_task_count || 0)
