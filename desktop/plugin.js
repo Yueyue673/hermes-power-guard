@@ -6,7 +6,6 @@ import {
   ErrorState,
   host,
   Input,
-  Loader,
   PALETTE_AREA,
   ROUTES_AREA,
   SegmentedControl,
@@ -31,6 +30,20 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 let pluginContext = null
 const QUERY_KEY = ['power-guard', 'status']
 const UI_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `renderer-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+const PAGE_CHROME = {
+  background: '#f7f5ef',
+  color: '#243d34',
+  colorScheme: 'light',
+  fontFamily: 'system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+  '--ui-text-primary': '#243d34',
+  '--ui-text-secondary': '#3e564b',
+  '--ui-text-tertiary': '#61746a',
+  '--ui-text-quaternary': '#7d8f84',
+  '--ui-stroke-tertiary': '#d5ddd0',
+  '--ui-accent': '#315e4b',
+  '--chrome-action-hover': '#e9efe5'
+}
 
 const ACTION_LABELS = {
   shutdown: '关机',
@@ -281,7 +294,7 @@ function FlatSection({ title, description, children, defaultOpen = true }) {
   return jsxs('section', { className: 'border-t border-(--ui-stroke-tertiary) pt-4', children: [
     jsxs(Button, { className: 'w-full items-start justify-between gap-4 text-left', onClick: () => setOpen(value => !value), size: 'inline', variant: 'text', children: [
       jsxs('span', { className: 'flex min-w-0 flex-col gap-1', children: [
-        jsx('span', { className: 'text-sm font-semibold text-(--ui-text-primary)', children: title }),
+        jsx('span', { className: 'text-sm font-medium text-(--ui-text-primary)', children: title }),
         description ? jsx('span', { className: 'text-xs leading-5 text-(--ui-text-tertiary)', children: description }) : null
       ] }),
       jsx(Codicon, { name: open ? 'chevron-up' : 'chevron-down', size: '0.9rem' })
@@ -302,7 +315,7 @@ function RuntimeHero({ status, dirty, connectionStale, onArm, cancelMutation, sn
       settings.dry_run ? jsx(Badge, { variant: 'muted', children: '模拟模式' }) : null
     ] }),
     jsxs('div', { className: 'flex max-w-3xl flex-col gap-2', children: [
-      jsx('h2', { className: 'text-2xl font-semibold leading-tight text-(--ui-text-primary)', children: conclusion.title }),
+      jsx('h2', { className: 'text-2xl font-medium leading-6 text-(--ui-text-primary)', children: conclusion.title }),
       jsx('p', { className: 'text-sm leading-6 text-(--ui-text-secondary)', children: conclusion.evidence }),
       jsx('p', { className: 'text-sm leading-6 text-(--ui-text-tertiary)', children: conclusion.next })
     ] }),
@@ -375,7 +388,7 @@ function LastResult({ status }) {
 }
 
 function OverviewView(props) {
-  return jsxs('div', { className: 'flex flex-col gap-6', children: [
+  return jsxs('div', { className: 'flex flex-col gap-8', children: [
     jsx(RuntimeHero, props),
     jsx(ExecutionPath, { status: props.status }),
     jsx(LiveEvidence, { status: props.status }),
@@ -390,9 +403,9 @@ function PolicyView({ status, draft, update, applyPreset }) {
     { value: 'hibernate', label: status.capabilities?.hibernate_available ? ACTION_LABELS.hibernate : '休眠（当前未启用）', disabled: !status.capabilities?.hibernate_available },
     { value: 'notify', label: ACTION_LABELS.notify }
   ]
-  return jsxs('div', { className: 'flex flex-col gap-6', children: [
+  return jsxs('div', { className: 'flex flex-col gap-8', children: [
     jsxs('section', { children: [
-      jsx('h2', { className: 'text-base font-semibold text-(--ui-text-primary)', children: '从预设开始' }),
+      jsx('h2', { className: 'text-base font-medium text-(--ui-text-primary)', children: '从预设开始' }),
       jsx('p', { className: 'mt-1 text-xs leading-5 text-(--ui-text-tertiary)', children: '预设只修改草稿；保存后才会生效。' }),
       jsx('div', { className: 'mt-4 divide-y divide-(--ui-stroke-tertiary) border-y border-(--ui-stroke-tertiary)', children: PRESETS.map(preset =>
         jsx('div', { className: 'py-3', children: jsxs(Button, { className: 'w-full items-start justify-between gap-4 text-left', onClick: () => applyPreset(preset), size: 'inline', variant: 'text', children: [
@@ -425,9 +438,9 @@ function PolicyView({ status, draft, update, applyPreset }) {
 }
 
 function EnergyView({ draft, update, connectionStale, testMutation, displayMutation }) {
-  return jsxs('div', { className: 'flex flex-col gap-6', children: [
+  return jsxs('div', { className: 'flex flex-col gap-8', children: [
     jsxs('section', { children: [
-      jsx('h2', { className: 'text-base font-semibold text-(--ui-text-primary)', children: '工作期间' }),
+      jsx('h2', { className: 'text-base font-medium text-(--ui-text-primary)', children: '工作期间' }),
       jsx('p', { className: 'mt-1 text-xs leading-5 text-(--ui-text-tertiary)', children: '这些设置只影响 Hermes 工作时的耗电和前台体验，不改变任务结束后的判断规则。' }),
       jsx('div', { className: 'mt-3 divide-y divide-(--ui-stroke-tertiary) border-y border-(--ui-stroke-tertiary)', children: [
         jsx(ToggleRow, { label: '阻止系统自动睡眠', help: '只保持系统运行，不强制点亮显示器。', checked: draft.prevent_sleep_while_working, onChange: value => update('prevent_sleep_while_working', value) }),
@@ -471,7 +484,7 @@ function HistoryView({ status }) {
   const outcome = value => ({ completed: '完成', blocked: '无法继续', failed: '失败', interrupted: '中断', unknown: '未知' }[value] || value || '运行中')
   return jsxs('div', { className: 'flex flex-col gap-8', children: [
     jsxs('section', { children: [
-      jsx('h2', { className: 'text-base font-semibold text-(--ui-text-primary)', children: '任务结果' }),
+      jsx('h2', { className: 'text-base font-medium text-(--ui-text-primary)', children: '任务结果' }),
       jsx('p', { className: 'mt-1 text-xs text-(--ui-text-tertiary)', children: `${tasks.length} 条记录；未知结果不会被当作完成。` }),
       tasks.length ? jsx('div', { className: 'mt-3 divide-y divide-(--ui-stroke-tertiary) border-y border-(--ui-stroke-tertiary)', children: tasks.map(task => jsxs('div', { className: 'grid gap-2 py-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto]', children: [
         jsxs('span', { className: 'flex min-w-0 flex-col gap-1', children: [
@@ -482,7 +495,7 @@ function HistoryView({ status }) {
       ] }, task.task_key)) }) : jsx('p', { className: 'mt-3 text-sm text-(--ui-text-tertiary)', children: '接管的当前任务或启用后开始的新任务会显示在这里。' })
     ] }),
     jsxs('section', { children: [
-      jsx('h2', { className: 'text-base font-semibold text-(--ui-text-primary)', children: '状态记录' }),
+      jsx('h2', { className: 'text-base font-medium text-(--ui-text-primary)', children: '状态记录' }),
       jsx('p', { className: 'mt-1 text-xs text-(--ui-text-tertiary)', children: `${events.length} 条事件，按时间倒序。` }),
       events.length ? jsx('ol', { className: 'mt-3 divide-y divide-(--ui-stroke-tertiary) border-y border-(--ui-stroke-tertiary)', children: events.map(event => jsxs('li', { className: 'grid gap-2 py-3 text-xs sm:grid-cols-[8rem_minmax(0,1fr)]', children: [
         jsx('time', { className: 'tabular-nums text-(--ui-text-quaternary)', children: timeLabel(event.created_at) }),
@@ -597,8 +610,8 @@ function PowerGuardPage() {
     onError: error => host.notifyError(error, '关闭显示器失败')
   })
 
-  if (statusQuery.isLoading && !statusQuery.data) return jsx('div', { className: 'flex h-full items-center justify-center', children: jsx(Loader, { type: 'lemniscate-bloom' }) })
-  if (statusQuery.error && !statusQuery.data) return jsx('div', { className: 'flex h-full items-center justify-center p-6', children: jsx(ErrorState, { title: 'Power Guard 后端尚未加载', description: '重启 Hermes Desktop 以挂载插件 API，然后重试。', children: jsx(Button, { onClick: () => statusQuery.refetch(), variant: 'outline', children: '重试连接' }) }) })
+  if (statusQuery.isLoading && !statusQuery.data) return jsx('div', { className: 'flex h-full items-center justify-center', style: PAGE_CHROME, children: jsx('p', { className: 'text-sm text-(--ui-text-tertiary)', children: '正在读取状态' }) })
+  if (statusQuery.error && !statusQuery.data) return jsx('div', { className: 'flex h-full items-center justify-center p-6', style: PAGE_CHROME, children: jsx(ErrorState, { title: 'Power Guard 后端尚未加载', description: '重启 Hermes Desktop 以挂载插件 API，然后重试。', children: jsx(Button, { onClick: () => statusQuery.refetch(), variant: 'outline', children: '重试连接' }) }) })
 
   const status = statusQuery.data
   if (!status || !draft) return null
@@ -606,11 +619,11 @@ function PowerGuardPage() {
   const update = (key, value) => { setDraft(current => ({ ...current, [key]: value })); setDirty(true) }
   const applyPreset = preset => { setDraft(current => ({ ...current, ...preset.values })); setDirty(true) }
 
-  return jsxs('div', { className: 'h-full overflow-auto', children: [
-    jsxs('main', { className: 'mx-auto flex w-full max-w-5xl flex-col gap-5 p-5', children: [
+  return jsxs('div', { className: 'h-full overflow-auto', style: PAGE_CHROME, children: [
+    jsxs('main', { className: 'mx-auto flex w-full max-w-5xl flex-col gap-8 p-6', children: [
       jsxs('header', { className: 'flex flex-wrap items-end justify-between gap-4', children: [
         jsxs('div', { className: 'flex flex-col gap-1', children: [
-          jsx('h1', { className: 'text-lg font-semibold text-(--ui-text-primary)', children: 'Power Guard' }),
+          jsx('h1', { className: 'text-lg font-medium text-(--ui-text-primary)', children: 'Power Guard' }),
           jsx('p', { className: 'text-xs leading-5 text-(--ui-text-tertiary)', children: '等待会话、后台进程和子代理结束，再检查键鼠空闲并显示可取消倒计时。' })
         ] }),
         jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
